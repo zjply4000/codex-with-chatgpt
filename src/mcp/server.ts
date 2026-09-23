@@ -1,9 +1,11 @@
+import fs from "node:fs";
+import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
 import { searchWorkspace } from "../workspace/search.js";
-import { gitDiff, gitInfo, gitStatus, type DiffMode } from "../workspace/git.js";
+import { gitDiff, gitInfo, gitStatus, type DiffMode, type WorkspaceLike } from "../workspace/git.js";
 import { executionRecordSchema, latestExecutionRecord, readExecutionRecords } from "../execution/records.js";
 import { listExecutionOutputs, readExecutionOutput } from "../execution/output.js";
 import type { Logger } from "../logger/index.js";
@@ -46,6 +48,45 @@ function requireScope(authInfo: AuthInfo | undefined, scope: string): ToolResult
     return fail("INSUFFICIENT_SCOPE", `This operation requires the '${scope}' scope.`);
   }
   return null;
+}
+
+function resolveGitTarget(workspace: Workspace, repoPath?: string): WorkspaceLike {
+  if (!repoPath || repoPath.trim() === "" || repoPath.trim() === ".") {
+    return {
+      root: workspace.root,
+      ignoreRules: workspace.ignoreRules,
+      ignorePathPrefix: undefined,
+    };
+  }
+  const resolved = workspace.resolve(repoPath);
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(resolved.abs);
+  } catch {
+    throw new WorkspaceError("FILE_NOT_FOUND", `Repository path not found: ${repoPath}`);
+  }
+  if (!stat.isDirectory()) {
+    throw new WorkspaceError("NOT_A_DIRECTORY", `Repository path is not a directory: ${repoPath}`);
+  }
+  return {
+    root: resolved.abs,
+    ignoreRules: workspace.ignoreRules,
+    ignorePathPrefix: resolved.rel || undefined,
+  };
+}
+
+function isPathInsideRepo(repoRoot: string, absPath: string): { inside: boolean; relScope?: string } {
+  const rel = path.relative(repoRoot, absPath);
+  const normalized = rel.split(path.sep).join("/");
+  const isOutside =
+    normalized === ".." ||
+    normalized.startsWith("../") ||
+    path.isAbsolute(rel);
+  if (isOutside) {
+    return { inside: false };
+  }
+  const relScope = normalized === "" || normalized === "." ? undefined : normalized;
+  return { inside: true, relScope };
 }
 
 const gitIdentityOutputSchema = z.object({
@@ -312,16 +353,26 @@ export function createMcpServer(ctx: McpContext): McpServer {
     "git_status",
     {
       title: "Git status",
-      description: `Structured git status of the workspace: branch, staged/unstaged/untracked files. ${UNTRUSTED_NOTE}`,
-      inputSchema: {},
+      description:
+        `Structured git status of the workspace or a nested git repository: branch, staged/unstaged/untracked files. ` +
+        `Defaults to the workspace root, or pass repo_path for aggregate/multi-repo workspaces. ${UNTRUSTED_NOTE}`,
+      inputSchema: {
+        repo_path: z
+          .string()
+          .optional()
+          .describe(
+            "Workspace-relative path selecting the directory in which Git commands run. Defaults to the workspace root."
+          ),
+      },
       outputSchema: gitStatusOutputSchema,
       annotations: { readOnlyHint: true },
     },
-    async (_args, extra) => {
+    async (args, extra) => {
       const denied = requireScope(extra.authInfo, "git.read");
       if (denied) return denied;
       try {
-        return okStructured(gitStatus(workspace));
+        const target = resolveGitTarget(workspace, args.repo_path);
+        return okStructured(gitStatus(target));
       } catch (error) {
         return mapError(error);
       }
@@ -334,8 +385,15 @@ export function createMcpServer(ctx: McpContext): McpServer {
       title: "Git diff",
       description:
         `Git diff with byte-offset pagination. mode: 'unstaged' (default), 'staged', or 'head' ` +
-        `(working tree vs HEAD). When hasMore is true, call again with offset=nextOffset. ${UNTRUSTED_NOTE}`,
+        `(working tree vs HEAD). Defaults to the workspace root, or pass repo_path for aggregate/multi-repo ` +
+        `workspaces. When hasMore is true, call again with offset=nextOffset. ${UNTRUSTED_NOTE}`,
       inputSchema: {
+        repo_path: z
+          .string()
+          .optional()
+          .describe(
+            "Workspace-relative path selecting the directory in which Git commands run. Defaults to the workspace root."
+          ),
         mode: z.enum(["unstaged", "staged", "head"]).default("unstaged"),
         path: z.string().optional().describe("Limit the diff to one workspace-relative path"),
         offset: z.number().int().min(0).default(0).describe("Byte offset for pagination"),
@@ -348,15 +406,26 @@ export function createMcpServer(ctx: McpContext): McpServer {
       const denied = requireScope(extra.authInfo, "git.read");
       if (denied) return denied;
       try {
-        let relPath: string | undefined;
+        const target = resolveGitTarget(workspace, args.repo_path);
+        let repoRelScope: string | undefined;
+
         if (args.path) {
-          relPath = workspace.resolve(args.path).rel;
+          const resolvedPath = workspace.resolve(args.path);
+          const check = isPathInsideRepo(target.root, resolvedPath.abs);
+          if (!check.inside) {
+            throw new WorkspaceError(
+              "INVALID_PATH",
+              `Path '${args.path}' is outside the selected repository '${args.repo_path ?? "."}'`
+            );
+          }
+          repoRelScope = check.relScope;
         }
+
         return okStructured(
           gitDiff(
-            workspace,
+            target,
             { mode: args.mode as DiffMode, offset: args.offset, maxBytes: args.max_bytes },
-            relPath
+            repoRelScope
           )
         );
       } catch (error) {

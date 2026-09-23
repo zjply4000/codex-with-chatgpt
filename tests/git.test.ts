@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { gitDiff, gitInfo, gitStatus } from "../src/workspace/git.js";
+import { gitDiff, gitInfo, gitStatus, type WorkspaceLike } from "../src/workspace/git.js";
+import { IgnoreRules } from "../src/workspace/ignore.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git } from "./helpers.js";
 
 let repo: string;
@@ -294,3 +295,119 @@ describe("gitDiff pagination", () => {
     git(repo, "reset", "--hard", "HEAD");
   });
 });
+
+describe("nested git repository with ignorePathPrefix", () => {
+  let aggregate: string;
+  let nestedDir: string;
+  let target: WorkspaceLike;
+
+  beforeAll(() => {
+    aggregate = makeTmpDir("nested-git-aggregate");
+    write(
+      aggregate,
+      ".c2cignore",
+      "/nested/repo/anchored-secret.txt\nworkspace-custom.txt\n"
+    );
+    nestedDir = path.join(aggregate, "nested", "repo");
+    fs.mkdirSync(nestedDir, { recursive: true });
+    makeGitRepo(nestedDir);
+
+    target = {
+      root: nestedDir,
+      ignoreRules: new IgnoreRules(aggregate),
+      ignorePathPrefix: "nested/repo",
+    };
+  });
+
+  afterAll(() => {
+    cleanup(aggregate);
+  });
+
+  it("reports status and diff for normal files in nested repository", () => {
+    write(nestedDir, "visible.txt", "visible content\n");
+    write(nestedDir, "hello.txt", "hello modified\n");
+    write(nestedDir, "staged_safe.txt", "staged content\n");
+    git(nestedDir, "add", "staged_safe.txt");
+
+    const status = gitStatus(target);
+    expect(status.isRepo).toBe(true);
+    expect(status.branch).toBe("main");
+    expect(status.untracked).toContain("visible.txt");
+    expect(status.unstaged.map((e) => e.path)).toContain("hello.txt");
+    expect(status.staged.map((e) => e.path)).toContain("staged_safe.txt");
+
+    const unstagedDiff = gitDiff(target, { mode: "unstaged" });
+    expect(unstagedDiff.isRepo).toBe(true);
+    expect(unstagedDiff.diff).toContain("hello.txt");
+    expect(unstagedDiff.diff).toContain("hello modified");
+
+    const stagedDiff = gitDiff(target, { mode: "staged" });
+    expect(stagedDiff.isRepo).toBe(true);
+    expect(stagedDiff.diff).toContain("staged_safe.txt");
+    expect(stagedDiff.diff).toContain("staged content");
+
+    git(nestedDir, "reset", "--hard", "HEAD");
+    git(nestedDir, "clean", "-fd");
+  });
+
+  it("hides built-in sensitive files like .env in nested repository", () => {
+    write(nestedDir, ".env", "NESTED_ENV_SECRET=secret123\n");
+    const status = gitStatus(target);
+    expect(status.untracked).not.toContain(".env");
+    expect(status.hidden.changes).toBeGreaterThanOrEqual(1);
+
+    git(nestedDir, "add", "-f", ".env");
+    const stagedDiff = gitDiff(target, { mode: "staged" });
+    expect(stagedDiff.diff).not.toContain("NESTED_ENV_SECRET");
+    expect(stagedDiff.diff).not.toContain(".env");
+
+    git(nestedDir, "reset", "--hard", "HEAD");
+    git(nestedDir, "clean", "-fd");
+  });
+
+  it("applies workspace-root .c2cignore and root-anchored rules to nested repository", () => {
+    write(nestedDir, "anchored-secret.txt", "ANCHORED_SECRET_DATA=xyz\n");
+    write(nestedDir, "workspace-custom.txt", "CUSTOM_SECRET_DATA=abc\n");
+    write(nestedDir, "public.txt", "public content\n");
+
+    const status = gitStatus(target);
+    expect(status.untracked).toContain("public.txt");
+    expect(status.untracked).not.toContain("anchored-secret.txt");
+    expect(status.untracked).not.toContain("workspace-custom.txt");
+
+    git(nestedDir, "add", "-f", "anchored-secret.txt", "workspace-custom.txt", "public.txt");
+    const stagedDiff = gitDiff(target, { mode: "staged" });
+    expect(stagedDiff.diff).toContain("public.txt");
+    expect(stagedDiff.diff).toContain("public content");
+    expect(stagedDiff.diff).not.toContain("ANCHORED_SECRET_DATA");
+    expect(stagedDiff.diff).not.toContain("CUSTOM_SECRET_DATA");
+    expect(stagedDiff.diff).not.toContain("anchored-secret.txt");
+    expect(stagedDiff.diff).not.toContain("workspace-custom.txt");
+
+    git(nestedDir, "reset", "--hard", "HEAD");
+    git(nestedDir, "clean", "-fd");
+  });
+
+  it("handles rename provenance safely in nested repository", () => {
+    write(nestedDir, "safe_initial.txt", "safe initial text\n");
+    write(nestedDir, "anchored-secret.txt", "TOP_SECRET_RENAME_LEAK=leak\n");
+    git(nestedDir, "add", "-f", "safe_initial.txt", "anchored-secret.txt");
+    git(nestedDir, "commit", "-m", "init rename baseline in nested repo");
+
+    // Case 1: Sensitive -> Safe rename (anchored-secret.txt -> safe_dest.txt)
+    git(nestedDir, "mv", "anchored-secret.txt", "safe_dest.txt");
+    const diff1 = gitDiff(target, { mode: "staged" });
+    expect(diff1.diff).not.toContain("TOP_SECRET_RENAME_LEAK");
+    expect(diff1.diff).not.toContain("safe_dest.txt");
+    expect(diff1.diff).not.toContain("anchored-secret.txt");
+
+    // Case 2: Safe -> Sensitive rename (safe_initial.txt -> .env)
+    git(nestedDir, "reset", "--hard", "HEAD");
+    git(nestedDir, "mv", "safe_initial.txt", ".env");
+    const diff2 = gitDiff(target, { mode: "staged" });
+    expect(diff2.diff).not.toContain(".env");
+
+    git(nestedDir, "reset", "--hard", "HEAD");
+  });
+});
+

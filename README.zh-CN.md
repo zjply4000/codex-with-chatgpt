@@ -107,7 +107,9 @@ Ready.
 - **数据面（MCP）**：ChatGPT 缺什么自己拉什么，共 9 个只读工具：
   `workspace_info`、`list_directory`、`read_file`、`search_workspace`、
   `git_status`、`git_diff`、`test_status`、`execution_summary`、
-  `execution_output`。
+  `execution_output`。在 aggregate / 多仓库工作区中，`git_status` 与 `git_diff`
+  支持 `repo_path` 参数（例如 `git_status({ repo_path: "admin" })`、
+  `git_diff({ repo_path: "server", mode: "head" })`）。
 - **独立审查**：Codex 执行完毕后，ChatGPT 通过 MCP 亲自检查真实的 git diff
   和测试记录——绝不因为 Codex 说"测试全过"就直接相信。
 

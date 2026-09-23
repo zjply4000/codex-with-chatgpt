@@ -52,9 +52,22 @@ export function gitInfo(root: string): GitInfo {
 export interface WorkspaceLike {
   root: string;
   ignoreRules?: IgnoreRules;
+  ignorePathPrefix?: string;
 }
 
 export type GitTarget = string | WorkspaceLike;
+
+export function toPolicyPath(repoRelPath: string, prefix?: string): string {
+  if (!prefix || prefix === "." || prefix === "") {
+    return repoRelPath;
+  }
+  if (!repoRelPath || repoRelPath === ".") {
+    return prefix;
+  }
+  const cleanPrefix = prefix.replace(/\\/g, "/").replace(/\/+$/, "");
+  const cleanPath = repoRelPath.replace(/\\/g, "/").replace(/^\/+/, "");
+  return `${cleanPrefix}/${cleanPath}`;
+}
 
 export interface GitStatusResult {
   isRepo: boolean;
@@ -74,6 +87,7 @@ export function gitStatus(target: GitTarget): GitStatusResult {
   const root = typeof target === "string" ? target : target.root;
   const ignoreRules =
     typeof target === "object" && target.ignoreRules ? target.ignoreRules : new IgnoreRules(root);
+  const ignorePathPrefix = typeof target === "object" ? target.ignorePathPrefix : undefined;
   const empty: GitStatusResult = {
     isRepo: false,
     branch: null,
@@ -89,7 +103,8 @@ export function gitStatus(target: GitTarget): GitStatusResult {
   const result = runGit(root, ["status", "--porcelain=v2", "--branch", "--", "."]);
   if (!result.ok) return empty;
   const out: GitStatusResult = { ...empty, hidden: { ...empty.hidden }, isRepo: true };
-  const withheld = (paths: string[]): boolean => paths.some((p) => ignoreRules.isSensitive(p));
+  const withheld = (paths: string[]): boolean =>
+    paths.some((p) => ignoreRules.isSensitive(toPolicyPath(p, ignorePathPrefix)));
 
   for (const line of result.stdout.split("\n")) {
     if (line.startsWith("# branch.head ")) {
@@ -196,6 +211,8 @@ export function gitDiff(
     typeof target === "object" && target.ignoreRules
       ? target.ignoreRules
       : new IgnoreRules(root);
+  const ignorePathPrefix = typeof target === "object" ? target.ignorePathPrefix : undefined;
+  const scope = relPath ?? opts.path;
 
   const mode = opts.mode ?? "unstaged";
   const offset = Math.max(0, Math.floor(opts.offset ?? 0));
@@ -236,9 +253,11 @@ export function gitDiff(
       const newPath = tokens[i++];
       if (oldPath && newPath) {
         // Layer 1: Security - EITHER side sensitive -> completely unsafe
-        const isSafe = !ignoreRules.isSensitive(oldPath) && !ignoreRules.isSensitive(newPath);
+        const isSafe =
+          !ignoreRules.isSensitive(toPolicyPath(oldPath, ignorePathPrefix)) &&
+          !ignoreRules.isSensitive(toPolicyPath(newPath, ignorePathPrefix));
         // Layer 2: Scope - EITHER side in scope -> relevant
-        const isRelevant = isPathInScope(oldPath, relPath) || isPathInScope(newPath, relPath);
+        const isRelevant = isPathInScope(oldPath, scope) || isPathInScope(newPath, scope);
         if (isSafe && isRelevant) {
           safePaths.push(oldPath, newPath);
         }
@@ -246,8 +265,8 @@ export function gitDiff(
     } else {
       const filePath = tokens[i++];
       if (filePath) {
-        const isSafe = !ignoreRules.isSensitive(filePath);
-        const isRelevant = isPathInScope(filePath, relPath);
+        const isSafe = !ignoreRules.isSensitive(toPolicyPath(filePath, ignorePathPrefix));
+        const isRelevant = isPathInScope(filePath, scope);
         if (isSafe && isRelevant) {
           safePaths.push(filePath);
         }

@@ -173,7 +173,9 @@ Credentials stay in the OS app state directory, not in the project.
 - **Data plane (MCP)**: ChatGPT pulls what it needs itself through 9 read-only
   tools: `workspace_info`, `list_directory`, `read_file`, `search_workspace`,
   `git_status`, `git_diff`, `test_status`, `execution_summary`,
-  `execution_output`.
+  `execution_output`. In aggregate / multi-repo workspaces, `git_status` and
+  `git_diff` accept `repo_path` (e.g. `git_status({ repo_path: "admin" })`,
+  `git_diff({ repo_path: "server", mode: "head" })`).
 - **Independent review**: after Codex executes, ChatGPT inspects the actual
   git diff and test records through MCP — it never trusts "all tests passed"
   claims blindly.

@@ -377,3 +377,162 @@ describe("MCP tools over Streamable HTTP", () => {
     git(root, "reset", "--hard", "HEAD");
   });
 });
+
+describe("aggregate workspace with nested Git repository over MCP", () => {
+  let aggRoot: string;
+  let nestedRepoDir: string;
+  let outsideDir: string;
+  let aggBridge: Bridge;
+  let aggClient: Client;
+  let symlinksReady = true;
+
+  beforeAll(async () => {
+    aggRoot = makeTmpDir("mcp-aggregate-ws");
+    // Stop Git from discovering the parent codex-with-chatgpt repository:
+    process.env.GIT_CEILING_DIRECTORIES = path.dirname(aggRoot);
+
+    // Create nested git repo
+    nestedRepoDir = path.join(aggRoot, "nested-repo");
+    fs.mkdirSync(nestedRepoDir, { recursive: true });
+    makeGitRepo(nestedRepoDir);
+
+    // Create an uncommitted change in nested-repo
+    write(nestedRepoDir, "src/index.ts", "export const nestedValue = 99;\n");
+    write(nestedRepoDir, "nested-safe.txt", "safe nested file\n");
+    write(nestedRepoDir, "..internal/file.ts", "export const internalValue = 1;\n");
+    git(nestedRepoDir, "add", "..internal/file.ts");
+    git(nestedRepoDir, "commit", "-m", "add internal file");
+    write(nestedRepoDir, "..internal/file.ts", "export const internalValue = 2; // safe-in-repo\n");
+
+    // Create an other directory in aggregate workspace (not in nested-repo)
+    write(aggRoot, "other-dir/outside-file.txt", "outside file content\n");
+
+    // Symlink escape test setup
+    outsideDir = makeTmpDir("mcp-agg-outside");
+    write(outsideDir, "secret.txt", "secret outside\n");
+    try {
+      fs.symlinkSync(outsideDir, path.join(aggRoot, "symlink-out"));
+    } catch {
+      symlinksReady = false;
+    }
+
+    aggBridge = await startBridge({
+      workspaceRoot: aggRoot,
+      port: 0,
+      persistRuntime: false,
+      authStoreFile: path.join(makeTmpDir("auth-agg"), "store.json"),
+    });
+    const tokens = aggBridge.authStore.issueTokens({
+      clientId: "agg-client",
+      scopes: ["workspace.read", "workspace.search", "git.read", "execution.read"],
+    });
+
+    aggClient = new Client({ name: "c2c-agg-client", version: "1.0.0" });
+    const transport = new StreamableHTTPClientTransport(new URL(`${aggBridge.localBaseUrl()}/mcp`), {
+      requestInit: { headers: { authorization: `Bearer ${tokens.accessToken}` } },
+    });
+    await aggClient.connect(transport);
+  });
+
+  afterAll(async () => {
+    await aggClient.close();
+    await aggBridge.close();
+    cleanup(aggRoot);
+    cleanup(outsideDir);
+    delete process.env.GIT_CEILING_DIRECTORIES;
+  });
+
+  it("git_status({}) reports isRepo: false for aggregate workspace root", async () => {
+    const result = await aggClient.callTool({ name: "git_status", arguments: {} });
+    const status = structuredJsonOf<{ isRepo: boolean }>(result);
+    expect(status.isRepo).toBe(false);
+  });
+
+  it("git_status({ repo_path: 'nested-repo' }) reports isRepo: true and nested repo changes", async () => {
+    const result = await aggClient.callTool({
+      name: "git_status",
+      arguments: { repo_path: "nested-repo" },
+    });
+    const status = structuredJsonOf<{
+      isRepo: boolean;
+      branch: string;
+      unstaged: { path: string }[];
+      untracked: string[];
+    }>(result);
+    expect(status.isRepo).toBe(true);
+    expect(status.branch).toBe("main");
+    expect(status.unstaged.some((entry) => entry.path === "src/index.ts")).toBe(true);
+    expect(status.untracked).toContain("nested-safe.txt");
+  });
+
+  it("git_diff({ repo_path: 'nested-repo', mode: 'unstaged' }) returns nested repo diff", async () => {
+    const result = await aggClient.callTool({
+      name: "git_diff",
+      arguments: { repo_path: "nested-repo", mode: "unstaged" },
+    });
+    const diff = structuredJsonOf<{ isRepo: boolean; diff: string }>(result);
+    expect(diff.isRepo).toBe(true);
+    expect(diff.diff).toContain("nestedValue = 99");
+  });
+
+  it("rejects repo_path escaping workspace with PATH_OUTSIDE_WORKSPACE", async () => {
+    const result = await aggClient.callTool({
+      name: "git_status",
+      arguments: { repo_path: "../outside" },
+    });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("PATH_OUTSIDE_WORKSPACE");
+  });
+
+  it("rejects repo_path via symlink escaping workspace", async () => {
+    if (!symlinksReady) return;
+    const result = await aggClient.callTool({
+      name: "git_status",
+      arguments: { repo_path: "symlink-out" },
+    });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("PATH_OUTSIDE_WORKSPACE");
+  });
+
+  it("supports git_diff.path scoping within selected repo and rejects path outside selected repo", async () => {
+    // 1. Path within selected repo
+    const inScope = await aggClient.callTool({
+      name: "git_diff",
+      arguments: {
+        repo_path: "nested-repo",
+        path: "nested-repo/src",
+        mode: "unstaged",
+      },
+    });
+    expect(inScope.isError ?? false).toBe(false);
+    const inScopeDiff = structuredJsonOf<{ isRepo: boolean; diff: string }>(inScope);
+    expect(inScopeDiff.isRepo).toBe(true);
+    expect(inScopeDiff.diff).toContain("nestedValue = 99");
+
+    // 2. Repo-internal path whose segment name begins with '..' (e.g. '..internal')
+    const dotDotScope = await aggClient.callTool({
+      name: "git_diff",
+      arguments: {
+        repo_path: "nested-repo",
+        path: "nested-repo/..internal",
+        mode: "unstaged",
+      },
+    });
+    expect(dotDotScope.isError ?? false).toBe(false);
+    const dotDotDiff = structuredJsonOf<{ isRepo: boolean; diff: string }>(dotDotScope);
+    expect(dotDotDiff.isRepo).toBe(true);
+    expect(dotDotDiff.diff).toContain("safe-in-repo");
+
+    // 3. Path outside selected repo but within workspace
+    const outOfScope = await aggClient.callTool({
+      name: "git_diff",
+      arguments: {
+        repo_path: "nested-repo",
+        path: "other-dir/outside-file.txt",
+        mode: "unstaged",
+      },
+    });
+    expect(outOfScope.isError).toBe(true);
+    expect(textOf(outOfScope)).toContain("INVALID_PATH");
+  });
+});
