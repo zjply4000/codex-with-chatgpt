@@ -4,6 +4,7 @@ import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
 import { findBinary } from "./detect.js";
 import { tunnelProtocolArgs } from "./protocol.js";
+import { cloudflaredCredentialPath } from "./cloudflared-paths.js";
 import type { TunnelDoctorReport, TunnelProvider, TunnelStatus } from "./provider.js";
 
 const CONNECTED_RE = /registered tunnel connection/i;
@@ -11,6 +12,7 @@ const HOSTNAME_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a
 
 export interface CloudflaredNamedTunnelOptions {
   tunnelName: string;
+  tunnelId?: string;
   hostname: string;
   logger?: Logger;
   binaryOverride?: string;
@@ -35,6 +37,7 @@ export function normalizeNamedTunnelHostname(hostname: string): string {
 export class CloudflaredNamedTunnel implements TunnelProvider {
   readonly name = "cloudflare-named";
   private readonly tunnelName: string;
+  private readonly tunnelId?: string;
   private readonly hostname: string;
   private readonly logger: Logger;
   private readonly binaryOverride?: string;
@@ -49,6 +52,10 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
       throw new Error("Named tunnel name must be between 1 and 128 characters");
     }
     this.tunnelName = tunnelName;
+    if (opts.tunnelId !== undefined) {
+      this.tunnelId = opts.tunnelId.trim();
+      if (!cloudflaredCredentialPath(this.tunnelId)) throw new Error("Invalid named tunnel UUID");
+    }
     this.hostname = normalizeNamedTunnelHostname(opts.hostname);
     this.logger = opts.logger ?? nullLogger;
     this.binaryOverride = opts.binaryOverride;
@@ -72,6 +79,7 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
       );
     }
 
+    const credentialPath = this.tunnelId ? cloudflaredCredentialPath(this.tunnelId) : null;
     return new Promise<string>((resolve, reject) => {
       const child = spawn(
         bin,
@@ -82,7 +90,8 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
           `http://127.0.0.1:${localPort}`,
           ...tunnelProtocolArgs(),
           "run",
-          this.tunnelName,
+          ...(credentialPath ? ["--credentials-file", credentialPath] : []),
+          this.tunnelId ?? this.tunnelName,
         ],
         { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
       );
@@ -167,6 +176,7 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
       url: this.connected ? this.publicUrl() : null,
       provider: this.name,
       detail: this.lastError ?? undefined,
+      startTimeoutMs: this.startTimeoutMs,
     };
   }
 

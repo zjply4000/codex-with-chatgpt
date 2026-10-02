@@ -46,9 +46,10 @@ Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](
 2. 下载：把 https://github.com/XiaoDuoYa/codex-with-chatgpt 克隆到
    ~/codex-with-chatgpt（已存在就 git pull 更新）。
 3. 构建：在该目录里执行 corepack pnpm install 和 corepack pnpm build。
-4. 安装 Skill：把仓库里的 skill/SKILL.md 复制到
-   ~/.codex/skills/codex-with-chatgpt/SKILL.md，并把文件中
-   "The codex-with-chatgpt checkout lives at:" 那一行的路径改成实际克隆路径。
+4. 安装 Skill：先确定 Codex home：如果设置了非空的 CODEX_HOME 就使用它，
+   否则使用 ~/.codex（Windows 默认为 %USERPROFILE%\.codex）。把仓库里的
+   skill/SKILL.md 复制到 <codex-home>/skills/codex-with-chatgpt/SKILL.md，
+   并把文件中 "The codex-with-chatgpt checkout lives at:" 那一行的路径改成实际克隆路径。
 5. 首次配置：按 SKILL.md 里的 first-time setup 流程执行
   （运行 c2c setup，用内置浏览器打开 ChatGPT 配置连接器并输入配对码）。
    全程只用内置浏览器，禁止打开任何第三方浏览器。
@@ -72,9 +73,10 @@ I am a non-technical user — do everything yourself:
 2. Download: clone https://github.com/XiaoDuoYa/codex-with-chatgpt into
    ~/codex-with-chatgpt (if it already exists, git pull to update).
 3. Build: inside that folder run `corepack pnpm install` then `corepack pnpm build`.
-4. Install the Skill: copy skill/SKILL.md to
-   ~/.codex/skills/codex-with-chatgpt/SKILL.md, and update the line
-   "The codex-with-chatgpt checkout lives at:" to the actual clone path.
+4. Install the Skill: determine the Codex home first: use a non-empty CODEX_HOME
+   when set, otherwise use ~/.codex (%USERPROFILE%\.codex on Windows). Copy
+   skill/SKILL.md to <codex-home>/skills/codex-with-chatgpt/SKILL.md, and update
+   the line "The codex-with-chatgpt checkout lives at:" to the actual clone path.
 5. First-time setup: follow the SKILL.md "first-time setup" workflow
    (run c2c setup, configure the ChatGPT connector in the BUILT-IN browser,
    enter the pairing code). Never open a third-party browser.
@@ -98,9 +100,18 @@ anytime. / Skill 每天自动检查一次 GitHub，有新版本会自动更新�
 
 ## Install → Setup → Use (manual)
 
-1. Install the Codex Skill: copy `skill/` to `~/.codex/skills/codex-with-chatgpt/`.
+Let `<codex-home>` be a non-empty `CODEX_HOME` when set; otherwise use `~/.codex`
+(`%USERPROFILE%\.codex` on Windows).
+
+1. Install the Codex Skill: copy `skill/` to `<codex-home>/skills/codex-with-chatgpt/`.
 2. Tell Codex: **"Set up Codex with ChatGPT."** (中文: "使用 Codex with ChatGPT 完成首次配置。")
 3. Use Codex normally: **"Use Codex with ChatGPT to implement XXX."**
+
+> **Installation scope:** This repository does not publish or install a Codex
+> Web GPT, launcher, or model-catalog entry. Installation consists of building
+> this checkout, installing `skill/SKILL.md` as a Codex Skill, and running
+> `c2c setup` to configure the ChatGPT connector. For Web GPT or model-catalog
+> problems, see [troubleshooting](docs/troubleshooting.md).
 
 That's the whole manual. You don't need to know what MCP, OAuth, tunnels,
 ports or localhost are — Codex configures everything automatically and you
@@ -170,15 +181,24 @@ Credentials stay in the OS app state directory, not in the project.
 - **Control plane (Computer Use)**: Codex and ChatGPT exchange tiny structured
   `[C2C]` state messages — `INIT → PLAN → EXECUTED → REVIEW → DONE`. No diffs,
   no logs, no file bodies are ever pasted.
-- **Data plane (MCP)**: ChatGPT pulls what it needs itself through 9 read-only
+- **Data plane (MCP)**: ChatGPT pulls what it needs itself through 10 read-only
   tools: `workspace_info`, `list_directory`, `read_file`, `search_workspace`,
   `git_status`, `git_diff`, `test_status`, `execution_summary`,
-  `execution_output`. In aggregate / multi-repo workspaces, `git_status` and
+  `execution_output`, `read_image`. In aggregate / multi-repo workspaces, `git_status` and
   `git_diff` accept `repo_path` (e.g. `git_status({ repo_path: "admin" })`,
   `git_diff({ repo_path: "server", mode: "head" })`).
 - **Independent review**: after Codex executes, ChatGPT inspects the actual
   git diff and test records through MCP — it never trusts "all tests passed"
   claims blindly.
+
+### Generated media handoff
+
+The connector remains read-only: `read_image` can inspect supported workspace
+images but cannot write files. After a requested image or video is downloaded
+through the visible ChatGPT UI, the local executor can validate and import the
+original with `c2c asset import -w <workspace> --from <download> --to <new-path>`.
+Imports are workspace-contained, signature-checked, size-limited, reject active
+SVG content, and never overwrite an existing file.
 
 ## Security model (short version)
 

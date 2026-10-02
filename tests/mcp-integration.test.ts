@@ -47,6 +47,7 @@ beforeAll(async () => {
   makeGitRepo(root);
   write(root, "package.json", JSON.stringify({ name: "demo", scripts: { test: "vitest run" }, dependencies: { react: "^19.0.0" } }));
   write(root, ".env", "API_KEY=supersecret\n");
+  fs.writeFileSync(path.join(root, "pixel.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]));
   // an uncommitted change so git_diff has content
   write(root, "src/index.ts", "export const answer = 43; // changed\n");
 
@@ -76,7 +77,7 @@ afterAll(async () => {
 });
 
 describe("MCP tools over Streamable HTTP", () => {
-  it("lists all nine read-only tools", async () => {
+  it("lists all ten read-only tools", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((tool) => tool.name).sort();
     expect(names).toEqual([
@@ -86,6 +87,7 @@ describe("MCP tools over Streamable HTTP", () => {
       "git_status",
       "list_directory",
       "read_file",
+      "read_image",
       "search_workspace",
       "test_status",
       "workspace_info",
@@ -98,6 +100,7 @@ describe("MCP tools over Streamable HTTP", () => {
     expectToolOutputSchema(tools, "workspace_info", ["workspaceId", "workspaceName", "projectType", "git"]);
     expectToolOutputSchema(tools, "list_directory", ["path", "entries", "total", "hasMore"]);
     expectToolOutputSchema(tools, "read_file", ["path", "content", "startLine", "endLine", "nextStartLine"]);
+    expectToolOutputSchema(tools, "read_image", ["path", "sizeBytes", "mimeType"]);
     expectToolOutputSchema(tools, "search_workspace", ["matches", "matchCount", "truncated", "engine"]);
     expectToolOutputSchema(tools, "git_status", ["isRepo", "branch", "staged", "unstaged", "untracked", "hidden"]);
     expectToolOutputSchema(tools, "git_diff", ["isRepo", "mode", "diff", "hasMore", "nextOffset"]);
@@ -129,6 +132,33 @@ describe("MCP tools over Streamable HTTP", () => {
     const result = await client.callTool({ name: "read_file", arguments: { path: "hello.txt" } });
     const file = structuredJsonOf<{ content: string; totalLines: number }>(result);
     expect(file.content).toContain("Hello from Codex with ChatGPT!");
+  });
+
+  it("read_image returns metadata and image content", async () => {
+    const result = await client.callTool({ name: "read_image", arguments: { path: "pixel.png" } });
+    expect(result.structuredContent).toEqual({ path: "pixel.png", sizeBytes: 11, mimeType: "image/png" });
+    const content = result.content as { type: string; mimeType?: string }[];
+    expect(content.some((item) => item.type === "image" && item.mimeType === "image/png")).toBe(true);
+  });
+
+  it("read_image keeps workspace containment, sensitive-path and signature checks", async () => {
+    write(root, "spoofed.png", "not an image");
+    for (const imagePath of [".env", "../outside.png", "spoofed.png"]) {
+      const result = await client.callTool({ name: "read_image", arguments: { path: imagePath } });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).not.toContain("supersecret");
+      expect((result.content as { type: string }[]).some((item) => item.type === "image")).toBe(false);
+    }
+  });
+
+  it("read_image rejects images beyond the size limit", async () => {
+    const largeImage = path.join(root, "oversized.png");
+    const fd = fs.openSync(largeImage, "w");
+    try { fs.ftruncateSync(fd, 10 * 1024 * 1024 + 1); }
+    finally { fs.closeSync(fd); }
+    const result = await client.callTool({ name: "read_image", arguments: { path: "oversized.png" } });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("FILE_TOO_LARGE");
   });
 
   it("read_file denies .env with ACCESS_DENIED_SENSITIVE_FILE and no content", async () => {
@@ -214,6 +244,35 @@ describe("MCP tools over Streamable HTTP", () => {
     expect(status.tests).toBe("27 passed");
     expect(status.outputAvailable).toBe(false);
     expect(status.outputId).toBeNull();
+  });
+
+  it("returns an optional executor through both execution MCP tools", async () => {
+    appendExecutionRecord(bridge.workspace.id, {
+      taskId: "c2c_executor", iteration: 2, changedFiles: 0, tests: "passed",
+      exitStatus: "ok", timestamp: new Date().toISOString(), executor: "antigravity",
+    });
+    const status = structuredJsonOf<{ executor: string }>(await client.callTool({ name: "test_status", arguments: {} }));
+    expect(status.executor).toBe("antigravity");
+    const summary = structuredJsonOf<{ records: { executor?: string }[] }>(
+      await client.callTool({ name: "execution_summary", arguments: {} })
+    );
+    expect(summary.records).toEqual(expect.arrayContaining([expect.objectContaining({ executor: "antigravity" })]));
+    expect(summary.records.some((record) => record.executor === undefined)).toBe(true);
+  });
+
+  it("read_image requires workspace.read scope", async () => {
+    const limited = bridge.authStore.issueTokens({ clientId: "image-scope", scopes: ["git.read"] });
+    const limitedClient = new Client({ name: "image-scope", version: "1.0.0" });
+    const transport = new StreamableHTTPClientTransport(new URL(`${bridge.localBaseUrl()}/mcp`), {
+      requestInit: { headers: { authorization: `Bearer ${limited.accessToken}` } },
+    });
+    try {
+      await limitedClient.connect(transport);
+      const result = await limitedClient.callTool({ name: "read_image", arguments: { path: "pixel.png" } });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("INSUFFICIENT_SCOPE");
+      expect((result.content as { type: string }[]).some((item) => item.type === "image")).toBe(false);
+    } finally { await limitedClient.close(); }
   });
 
   it("skips invalid persisted records when reporting execution status", async () => {

@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { cloudflaredCredentialPath, hasCloudflaredCert } from "./cloudflared-paths.js";
+export { cloudflaredCertPath, cloudflaredCredentialPath, hasCloudflaredCert } from "./cloudflared-paths.js";
 import { findBinary } from "./detect.js";
 import { suggestedNamedHostname } from "./hostname.js";
 import { normalizeNamedTunnelHostname } from "./cloudflared-named.js";
@@ -12,8 +12,24 @@ import {
 } from "./state.js";
 
 const TUNNEL_ID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+const TUNNEL_ID_FULL_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const LOGIN_TIMEOUT_MS = 5 * 60_000;
 const COMMAND_TIMEOUT_MS = 45_000;
+const MAX_CREDENTIAL_BYTES = 1024 * 1024;
+
+export type NamedTunnelCredentialStatus =
+  | "missing_tunnel_id"
+  | "missing_credentials"
+  | "unreadable_credentials"
+  | "invalid_credentials"
+  | "mismatched_credentials"
+  | "ready";
+
+export interface NamedTunnelCredentialCheck {
+  status: NamedTunnelCredentialStatus;
+  /** Kept for local diagnostics and tests; callers must not serialize its contents. */
+  credentialPath: string | null;
+}
 
 export interface ListedTunnel {
   id: string;
@@ -28,17 +44,74 @@ export interface CloudflaredAccount {
   routeDns(tunnelName: string, hostname: string): Promise<void>;
 }
 
-export function cloudflaredCertPath(): string {
-  const override = process.env.TUNNEL_ORIGIN_CERT?.trim();
-  if (override) return override;
-  return path.join(os.homedir(), ".cloudflared", "cert.pem");
+/**
+ * Check UUID-specific run credentials without exposing their contents.
+ * Account cert.pem authorizes management commands, not this run operation.
+ * Inspection is read-only; credential repair requires an explicit action.
+ */
+export function inspectNamedTunnelCredentials(tunnelId?: string, platform: NodeJS.Platform = process.platform): NamedTunnelCredentialCheck {
+  const credentialPath = cloudflaredCredentialPath(tunnelId ?? "", platform);
+  if (!credentialPath) return { status: "missing_tunnel_id", credentialPath: null };
+
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(credentialPath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return {
+      status: code === "ENOENT" || code === "ENOTDIR" ? "missing_credentials" : "unreadable_credentials",
+      credentialPath,
+    };
+  }
+  if (!stat.isFile() || stat.size > MAX_CREDENTIAL_BYTES) {
+    return { status: "unreadable_credentials", credentialPath };
+  }
+
+  let raw: string;
+  try {
+    raw = fs.readFileSync(credentialPath, "utf8");
+  } catch {
+    return { status: "unreadable_credentials", credentialPath };
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return { status: "invalid_credentials", credentialPath };
+    const record = parsed as { TunnelID?: unknown; TunnelSecret?: unknown };
+    if (
+      typeof record.TunnelID !== "string" ||
+      !TUNNEL_ID_FULL_RE.test(record.TunnelID) ||
+      typeof record.TunnelSecret !== "string" ||
+      record.TunnelSecret.trim().length === 0
+    ) {
+      return { status: "invalid_credentials", credentialPath };
+    }
+    if (record.TunnelID.toLowerCase() !== tunnelId!.trim().toLowerCase()) {
+      return { status: "mismatched_credentials", credentialPath };
+    }
+    return { status: "ready", credentialPath };
+  } catch {
+    return { status: "invalid_credentials", credentialPath };
+  }
 }
 
-export function hasCloudflaredCert(): boolean {
-  try {
-    return fs.statSync(cloudflaredCertPath()).isFile();
-  } catch {
-    return false;
+export function namedTunnelCredentialRepairMessage(status: NamedTunnelCredentialStatus, platform: NodeJS.Platform = process.platform): string {
+  switch (status) {
+    case "missing_credentials": {
+      const location = platform === "win32" ? "%USERPROFILE%\\.cloudflared\\<TUNNEL-UUID>.json" : "~/.cloudflared/<TUNNEL-UUID>.json";
+      const destination = platform === "win32" ? location : "$HOME/.cloudflared/<TUNNEL-UUID>.json";
+      return `固定域名缺少 Tunnel 凭据文件。请从管理端恢复对应的 UUID.json（默认位置 ${location}；设置了 TUNNEL_CRED_FILE 时恢复该指定文件）；如需重新获取，在有账号证书的机器运行 cloudflared tunnel token --cred-file "${destination}" <TUNNEL-UUID>，完成后再运行 c2c doctor。`;
+    }
+    case "unreadable_credentials":
+      return "固定域名的 Tunnel 凭据文件不可读或过大。请恢复正确的 UUID.json 文件权限和内容，再运行 c2c doctor。";
+    case "invalid_credentials":
+      return "固定域名的 Tunnel 凭据文件不是有效的本地 Tunnel JSON。请恢复正确文件，再运行 c2c doctor。";
+    case "mismatched_credentials":
+      return "固定域名的 Tunnel 凭据与当前保存的 Tunnel ID 不匹配。请恢复对应的 UUID.json 文件，再运行 c2c doctor。";
+    case "missing_tunnel_id":
+      return "固定域名状态缺少 Tunnel ID。请运行 c2c setup 重新保存 Named Tunnel 状态。";
+    case "ready":
+      return "固定域名凭据已就绪。";
   }
 }
 
@@ -163,6 +236,9 @@ export class ProcessCloudflaredAccount implements CloudflaredAccount {
   }
 
   private run(args: string[]): { ok: boolean; stdout: string; stderr: string } {
+    if (!this.hasCert()) {
+      throw new Error("NAMED_TUNNEL_MANAGEMENT_MISSING_ACCOUNT_CERTIFICATE: Tunnel 管理操作需要账号证书。请运行 cloudflared tunnel login；运行已有 UUID Tunnel 不需要此证书。");
+    }
     const result = spawnSync(this.binary(), args, {
       encoding: "utf8",
       timeout: COMMAND_TIMEOUT_MS,

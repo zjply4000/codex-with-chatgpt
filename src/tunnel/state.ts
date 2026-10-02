@@ -46,9 +46,9 @@ export function isNamedTunnelReady(state: TunnelState): boolean {
   );
 }
 
-export function namedTunnelBinding(state: TunnelState): { tunnelName: string; hostname: string } | null {
+export function namedTunnelBinding(state: TunnelState): { tunnelName: string; tunnelId?: string; hostname: string } | null {
   if (!isNamedTunnelReady(state) || !state.tunnelName || !state.hostname) return null;
-  return { tunnelName: state.tunnelName, hostname: state.hostname };
+  return { tunnelName: state.tunnelName, tunnelId: state.tunnelId, hostname: state.hostname };
 }
 
 export const TUNNEL_CHOICE_PROMPT = `连 ChatGPT 之前，有一条可选的。
@@ -64,4 +64,4 @@ export const NAMED_FALLBACK_MESSAGE =
   "这次先用临时地址。功能一样，以后修连接可能会更慢。想改成固定域名时再说一声。";
 
 export const NAMED_REPAIR_MESSAGE =
-  "固定域名暂时连不上。请在即将弹出的窗口登录 Cloudflare，选中你的域名，完成后告诉我「好了」。";
+  "固定域名凭据已就绪，但连接未恢复。请检查 cloudflared 运行状态、网络及域名 DNS，处理后再运行 c2c doctor。";

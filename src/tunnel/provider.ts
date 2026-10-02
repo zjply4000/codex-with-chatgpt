@@ -9,6 +9,8 @@ export interface TunnelStatus {
   url: string | null;
   provider: string;
   detail?: string;
+  /** Actual provider budget, so a reusing CLI can wait for its result. */
+  startTimeoutMs?: number;
 }
 
 export interface TunnelDoctorReport {

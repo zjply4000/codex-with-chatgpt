@@ -88,7 +88,8 @@ whatever data it needs by itself.
    - sandbox / state-dir write failed (EPERM)
    - this workspace used to have a public URL and the tunnel is down
    - `chatgptRepair.needed` is true (fix the connector first, then doctor again)
-   - `namedRepair.needed` is true (user must log in to Cloudflare, then doctor again.
+   - `namedRepair.needed` is true (follow `namedRepair.userMessage` to repair the
+     Tunnel run credential or connectivity fault, then doctor again.
      Do not Delete the ChatGPT connector — the address did not change)
    - `bridgeRepair.needed` is true: follow **Workflow: bridge runtime repair**
      before any named / ChatGPT repair. A live instance with an untrusted record
@@ -192,9 +193,17 @@ that close the tab, hide the window, or stall on the settings page.
 
 - The codex-with-chatgpt checkout lives at: `<ACTUAL_CHECKOUT_PATH>`
   (installer/update MUST replace this line in the installed Skill with the user's actual checkout path.)
+- Codex home: let `<codex-home>` be a non-empty `CODEX_HOME` when set; otherwise
+  use `~/.codex` (`%USERPROFILE%\.codex` on Windows).
 - CLI: let `<checkout>` mean the path on the previous line; run
   `node "<checkout>/bin/c2c.js" <command>` (or `c2c <command>` if globally linked).
   All commands support `--json` for parsing.
+
+In aggregate / multi-repo workspaces, `workspace_info.git.isRepo` may be false
+for the workspace root. Select the intended nested repository with
+`git_status({ repo_path: "<repo>" })` and
+`git_diff({ repo_path: "<repo>", mode: "head" })`. Paths are workspace-relative;
+workspace containment and sensitive-path rules still apply.
 - If the checkout has no `node_modules` or no `dist/`, first run
   `corepack pnpm install && corepack pnpm build` inside it.
 - For commands that act on the user's project (`setup`, `doctor`, `session`,
@@ -214,7 +223,7 @@ commands (local safety checks always run; network checks are cached):
 2. `c2c sandbox-allow --json` (do not pass `-w`) — writes the C2C state directory into Codex's
    sandbox `writable_roots` (macOS: `~/Library/Application Support/codex-with-chatgpt`;
    Windows: `%LOCALAPPDATA%\codex-with-chatgpt`; config file is
-   `~/.codex/config.toml` on both, or `%USERPROFILE%\.codex\config.toml` on Windows).
+   `<codex-home>/config.toml`; see **Locations**).
    If already allowlisted, this is a no-op and does not trigger elevation.
 
 - The checker uses this checkout's current branch and its configured upstream,
@@ -260,7 +269,7 @@ an explicit user request to update C2C:
 4. `corepack pnpm install && corepack pnpm build`. If either fails, report the
    failed update step; do not claim completion or discard local files.
 5. Re-install the Skill: copy `skill/SKILL.md` to
-   `~/.codex/skills/codex-with-chatgpt/SKILL.md`, then fix the "checkout lives at:"
+   `<codex-home>/skills/codex-with-chatgpt/SKILL.md`, then fix the "checkout lives at:"
    line in the copy to the actual checkout path.
 6. `c2c sandbox-allow --json`, then `c2c doctor -w <workspace> --json`.
    Respect the existing Doctor gate and controlled bridge runtime repair rules.
@@ -650,9 +659,12 @@ ChatGPT's replies are expected to be substantive (see step 3). Docs: `docs/proto
    **Connection choice** first (existing installs: ask once, then remember).
    Then `c2c doctor -w <workspace> --json` (auto-repairs). **Doctor gate:** if local
    is not green, do not open ChatGPT and do not send INIT. If
-   `namedRepair.needed` is true, tell the user `namedRepair.userMessage`, run
-   `c2c tunnel login --json` (their browser; Cloudflare exception), then doctor
-   again. If `chatgptRepair.needed` is true, tell the user `chatgptRepair.userMessage`
+   `namedRepair.needed` is true, tell the user `namedRepair.userMessage` and
+   follow that specific diagnosis, then doctor again. Running an existing UUID
+   Tunnel does not need `cert.pem`. Use `c2c tunnel login --json` (their browser;
+   Cloudflare exception) only when an explicit management operation needs a
+   missing account certificate; JSON faults require the indicated repair.
+   If `chatgptRepair.needed` is true, tell the user `chatgptRepair.userMessage`
    (one paragraph, no internals), run **Workflow: reconnect after address
    reclaim**, then doctor again and only continue when the gate is green.
    For explicit adopt intent, defer task-id generation and checkpoint recovery
@@ -777,6 +789,26 @@ If status is restricted, ignore it and review from git_diff.
     decision the user must make.
     `c2c session set -w <ws> --protocol-state BLOCKED --waiting-for USER --known-issues "<short reason>"`
 
+## Workflow: ChatGPT-generated media
+
+The connector remains read-only. It can view supported PNG/JPEG/GIF/WebP/SVG
+files with `read_image`, but it cannot write into the repository or retrieve a
+browser download by itself.
+
+When the user asks ChatGPT web to generate an image or video:
+
+1. Generate it in the workspace's saved ChatGPT conversation using the same
+   built-in browser tab and connector rules above.
+2. Activate the finished asset's actual Download control through the visible
+   ChatGPT UI. Browser screenshots are navigation evidence only; never save,
+   crop, rename, or import a screenshot as the requested asset.
+3. Import the original download through the local execution harness:
+   `c2c asset import -w <ws> --from <downloaded-file> --to <new-workspace-relative-path> --json`.
+4. The destination must be new and project-relative. The importer validates
+   PNG/JPEG/GIF/WebP/SVG/MP4/MOV/WebM content, rejects active SVG and path
+   escapes, and never overwrites an existing file. Include the imported path in
+   EXECUTED/review.
+
 ## Workflow: disconnect（"断开 ChatGPT"）
 
 1. `c2c unpair -w <workspace>` (revokes all tokens immediately).
@@ -853,8 +885,11 @@ the previous public address is gone. Doctor already started a new one.
    `[C2C]` until local is green, except reconnect settings pages.
    After ANY doctor call, if `bridgeRepair.needed` is true, follow
    **Workflow: bridge runtime repair** and stop this ordinary recovery path.
-2. If `namedRepair.needed`, tell the user `namedRepair.userMessage`, run
-   `c2c tunnel login --json`, then doctor again. Do not Delete the connector.
+2. If `namedRepair.needed`, tell the user `namedRepair.userMessage` and follow
+   the specific run credential or connectivity diagnosis, then doctor again.
+   Absence of `cert.pem` alone does not block an existing UUID Tunnel. Only an
+   explicit management operation needing a missing account certificate calls
+   for `c2c tunnel login --json`. Do not Delete the connector.
 3. If `chatgptRepair.needed`, follow **reconnect after address reclaim**, then
    doctor again.
 4. Otherwise apply the recovery map. Only involve the user for login / 2FA /
@@ -909,7 +944,7 @@ without instanceId is deliberately unverified, even when its PID is alive.
 | --- | --- |
 | Bridge not running | `c2c start` (doctor does this automatically) |
 | `bridgeRepair.needed` / `stale_runtime` / `admin_unavailable` | Follow controlled bridge runtime repair: `c2c bridge recover --json` in the target cwd (otherwise pass `-w`). Refuse unsafe identification; no force, manual PID kill, re-pair or connector recreation. |
-| Tunnel dead / URL unreachable / 全关掉后连接失效 | `c2c doctor` → if `namedRepair.needed`, login to Cloudflare and doctor again (do not Delete). If `chatgptRepair.needed`, tell the user the message, then **Delete** THIS workspace's connector only (`connectorName`) and create it again. Never Reconnect. After recreate, re-check `workspace_info` in the saved chat; if it still fails, new chat in the same Project (or long-chat switch) + HANDOFF. |
+| Tunnel dead / URL unreachable / 全关掉后连接失效 | `c2c doctor` → if `namedRepair.needed`, follow `namedRepair.userMessage` for the specific credential repair and doctor again (do not Delete). If `chatgptRepair.needed`, tell the user the message, then **Delete** THIS workspace's connector only (`connectorName`) and create it again. Never Reconnect. After recreate, re-check `workspace_info` in the saved chat; if it still fails, new chat in the same Project (or long-chat switch) + HANDOFF. |
 | Collection page shows only Retry | Same iab tab: Retry once, then open the last working chat and click its Project link. Do not write INIT/EXECUTED waiting checkpoints until the message is visible. |
 | ChatGPT says tool call failed / 401 | token expired or revoked → re-pair (new pairing code + authorize) |
 | Pairing code rejected/expired | `c2c pair --json` for a fresh code |

@@ -8,7 +8,7 @@ export interface BridgeAdminInfo {
   workspaceRoot: string;
   port: number;
   publicUrl: string | null;
-  tunnel: { running: boolean; url: string | null; provider: string };
+  tunnel: { running: boolean; url: string | null; provider: string; startTimeoutMs?: number };
   tokenCount: number;
   pairingActive: boolean;
   pid: number;

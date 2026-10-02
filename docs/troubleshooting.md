@@ -19,6 +19,37 @@ If doctor says the bridge state is **uncertain** (无法确认), do not start a
 second bridge and do not Delete the ChatGPT connector. Wait and run doctor
 again. The local process may still be running.
 
+### Codex Web GPT launcher or model catalog is missing
+
+This repository installs the Codex Skill and the C2C Bridge. It does **not**
+ship the separate `Codex Web GPT` desktop launcher or the native Codex model
+catalog UI. If that launcher says **Install into Codex / 安装到 Codex** is
+incomplete, separate route installation from catalog verification:
+
+- The launcher can successfully write its local `openai_base_url` route while
+  the existing Codex process is still using the old configuration.
+- Fully quit Codex, including its background/tray `ChatGPT.exe` process on
+  Microsoft Store Windows installations, then reopen it. Closing only the
+  window is not a restart. Keep the launcher open while it verifies the
+  catalog.
+- Repeating the install step does not reload an already-running Codex process.
+  It only writes the same route again and can reset the pending verification
+  state.
+
+For the C2C repository itself, verify the checkout and installed Skill path,
+rebuild with `corepack pnpm install && corepack pnpm build`, then run:
+
+```
+c2c doctor --json -w <workspace>
+c2c status --json -w <workspace>
+```
+
+If those checks are healthy but the separate Web GPT launcher or model picker
+still fails, capture the OS, Codex version, launcher version, exact UI error,
+and timestamp for the launcher issue. Do not change tunnel settings or delete
+the saved route as a workaround: the launcher owns its route backup and is
+expected to restore it when its Bridge is turned off.
+
 ### Everything was quit and ChatGPT can no longer connect
 Quitting Codex / the terminal stops the public address. The next `c2c doctor`
 starts a new address and sets `chatgptRepair.needed`. The Skill should tell the
@@ -45,7 +76,9 @@ Same as above: `c2c doctor`, then Delete + recreate THIS workspace's
 connector if `chatgptRepair.needed`. Mint a pairing code with `c2c pair` only
 when the Authorize form is on screen.
 If this workspace uses a stable hostname, doctor sets `namedRepair` instead —
-re-login to Cloudflare (`c2c tunnel login`) and doctor again. Do not Delete
+follow `namedRepair.userMessage` for the specific credential or connectivity
+fault and doctor again. Use `c2c tunnel login` only for a missing account
+certificate. Do not Delete
 the connector; the address did not change.
 
 ### I have a Cloudflare domain and want a stable hostname
@@ -91,14 +124,33 @@ The C2C state directory lives outside the project (macOS:
 there, so each new chat looks like a health-check failure.
 
 `c2c setup`, `c2c doctor` and `c2c sandbox-allow` add that directory to
-`[sandbox_workspace_write].writable_roots` in `~/.codex/config.toml`
-(`%USERPROFILE%\.codex\config.toml` on Windows). After that, later chats
-do not need elevation.
+`[sandbox_workspace_write].writable_roots` in `<codex-home>/config.toml`, where
+`<codex-home>` is a non-empty `CODEX_HOME` when set, otherwise `~/.codex`
+(`%USERPROFILE%\.codex` on Windows). After that, later chats do not need
+elevation.
 
 ### Port already in use
 Handled automatically: an existing healthy bridge for the same workspace is
 reused; anything else makes the bridge pick a free port. Configuration follows
 automatically.
+
+### Fixed hostname is configured, but the Named Tunnel does not start
+`cert.pem` and the Named Tunnel credential are different files. `cert.pem`
+authorizes account management (list/create/delete/route), and is not required
+to run an existing Tunnel by UUID. The runner uses the saved `tunnelId` and
+its corresponding `<TUNNEL-UUID>.json`. `TUNNEL_CRED_FILE` takes precedence;
+otherwise Windows checks `%USERPROFILE%\.cloudflared`, and macOS/Linux check
+`~/.cloudflared`, `/etc/cloudflared`, then `/usr/local/etc/cloudflared`.
+`c2c doctor --json` diagnoses missing/unreadable/invalid/mismatched run
+credentials without requiring `cert.pem`. It never prints credential contents
+or repairs files automatically. A healthy verified Named connection is not
+marked failed merely because the account certificate is absent.
+
+When the diagnostic says the credential is missing, recover the credential for
+the existing Tunnel from its administrator, or use `cloudflared tunnel token
+--cred-file` on a machine with the account certificate, then run `c2c doctor`
+again. Missing account certificates require login only when performing those
+management operations. Do not paste credentials into ChatGPT or project files.
 
 ### Reading a file returns ACCESS_DENIED_SENSITIVE_FILE
 Working as intended: `.env`, keys, credentials and anything matched by

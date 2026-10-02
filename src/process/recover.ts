@@ -8,6 +8,7 @@ import { verifyBridgeConnection, type BridgeAdminInfo } from "../bridge/verify.j
 import { connectorAction, connectorNameFor, endpointFile, mcpUrlFromPublic, normalizePublicUrl, readLastEndpoint, writeLastEndpoint, reclaimUserMessage } from "../config/endpoint.js";
 import { isNamedTunnelReady, readTunnelState, tunnelStateFile } from "../tunnel/state.js";
 import { normalizeNamedTunnelHostname } from "../tunnel/cloudflared-named.js";
+import { tunnelStartRequestTimeoutMs } from "../tunnel/timeouts.js";
 import { adminFetch, BridgeAdminUnavailableError, ensureBridge, type EnsureBridgeResult } from "./daemon.js";
 import { createProcessInspector, type ProcessInspector, type ProcessRecord, type ProcessSnapshot } from "./inspect.js";
 import { acquireMaintenance } from "./maintenance.js";
@@ -159,7 +160,8 @@ function defaults(): RecoveryDependencies {
     info: runtime => adminFetch(runtime, "GET", "/admin/info"),
     start: (root, token) => ensureBridge(root, { recoveryToken: token }),
     startTunnel: async (runtime, token) => {
-      const result = await adminFetch<{ url?: string }>(runtime, "POST", "/admin/tunnel/start", 90_000, token);
+      const info = await adminFetch<BridgeAdminInfo>(runtime, "GET", "/admin/info");
+      const result = await adminFetch<{ url?: string }>(runtime, "POST", "/admin/tunnel/start", tunnelStartRequestTimeoutMs(info.tunnel.startTimeoutMs), token);
       if (!result.url) throw new Error("tunnel start did not return a URL");
       return result.url;
     }, verify: verifyBridgeConnection, portFree: portIsFree,

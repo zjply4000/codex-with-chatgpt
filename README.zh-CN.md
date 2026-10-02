@@ -30,9 +30,10 @@ Agent（Codex），然后去倒杯咖啡：
 2. 下载：把 https://github.com/XiaoDuoYa/codex-with-chatgpt 克隆到
    ~/codex-with-chatgpt（已存在就 git pull 更新）。
 3. 构建：在该目录里执行 corepack pnpm install 和 corepack pnpm build。
-4. 安装 Skill：把仓库里的 skill/SKILL.md 复制到
-   ~/.codex/skills/codex-with-chatgpt/SKILL.md，并把文件中
-   "The codex-with-chatgpt checkout lives at:" 那一行的路径改成实际克隆路径。
+4. 安装 Skill：先确定 Codex home：如果设置了非空的 CODEX_HOME 就使用它，
+   否则使用 ~/.codex（Windows 默认为 %USERPROFILE%\.codex）。把仓库里的
+   skill/SKILL.md 复制到 <codex-home>/skills/codex-with-chatgpt/SKILL.md，
+   并把文件中 "The codex-with-chatgpt checkout lives at:" 那一行的路径改成实际克隆路径。
 5. 首次配置：按 SKILL.md 里的 first-time setup 流程执行
   （运行 c2c setup，用内置浏览器打开 ChatGPT 配置连接器并输入配对码）。
    全程只用内置浏览器，禁止打开任何第三方浏览器。
@@ -47,9 +48,17 @@ Agent（Codex），然后去倒杯咖啡：
 
 ## 安装 → 配置 → 使用（手动版）
 
-1. 安装 Codex Skill：把 `skill/` 复制到 `~/.codex/skills/codex-with-chatgpt/`。
+设 `<codex-home>` 为：如果 `CODEX_HOME` 已设置且非空，则使用 `CODEX_HOME`；
+否则使用 `~/.codex`（Windows 上默认为 `%USERPROFILE%\.codex`）。
+
+1. 安装 Codex Skill：把 `skill/` 复制到 `<codex-home>/skills/codex-with-chatgpt/`。
 2. 对 Codex 说：**"使用 Codex with ChatGPT 完成首次配置。"**
 3. 之后正常使用：**"使用 Codex with ChatGPT，帮我实现 XXX。"**
+
+> **安装范围：** 本项目不会发布或安装 Codex 网页版 GPT、启动器或模型目录条目。
+> 安装内容是构建本仓库、把 `skill/SKILL.md` 安装为 Codex Skill，然后运行
+> `c2c setup` 配置 ChatGPT 连接器。网页版 GPT 或模型目录的问题请先查看
+> [故障排查](docs/troubleshooting.md)。
 
 说明书到此结束。你不需要知道 MCP、OAuth、Tunnel、端口、localhost 是什么——
 Codex 会自动完成所有配置，你只会看到：
@@ -104,14 +113,21 @@ Ready.
 - **控制面（Computer Use）**：Codex 与 ChatGPT 之间只交换极小的结构化 `[C2C]`
   状态消息——`INIT → PLAN → EXECUTED → REVIEW → DONE`。绝不粘贴 diff、日志
   或文件内容。
-- **数据面（MCP）**：ChatGPT 缺什么自己拉什么，共 9 个只读工具：
+- **数据面（MCP）**：ChatGPT 缺什么自己拉什么，共 10 个只读工具：
   `workspace_info`、`list_directory`、`read_file`、`search_workspace`、
   `git_status`、`git_diff`、`test_status`、`execution_summary`、
-  `execution_output`。在 aggregate / 多仓库工作区中，`git_status` 与 `git_diff`
+  `execution_output`、`read_image`。在 aggregate / 多仓库工作区中，`git_status` 与 `git_diff`
   支持 `repo_path` 参数（例如 `git_status({ repo_path: "admin" })`、
   `git_diff({ repo_path: "server", mode: "head" })`）。
 - **独立审查**：Codex 执行完毕后，ChatGPT 通过 MCP 亲自检查真实的 git diff
   和测试记录——绝不因为 Codex 说"测试全过"就直接相信。
+
+### 生成媒体交接
+
+连接器仍然只读：`read_image` 可以查看工作区中的受支持图片，但不能写文件。
+通过可见的 ChatGPT 页面下载图片或视频原件后，本地执行端可以运行
+`c2c asset import -w <workspace> --from <download> --to <new-path>` 安全导入。
+导入过程限制在工作区内，会验证签名和大小、拒绝活动 SVG，并且绝不覆盖现有文件。
 
 ## 安全模型（简版）
 
