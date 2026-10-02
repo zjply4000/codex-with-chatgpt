@@ -136,12 +136,6 @@ const readFileOutputSchema = {
   content: z.string(),
 };
 
-const readImageOutputSchema = {
-  path: z.string(),
-  sizeBytes: z.number().int().nonnegative(),
-  mimeType: z.string(),
-};
-
 const searchMatchOutputSchema = z.object({
   path: z.string(),
   line: z.number().int().nonnegative(),
@@ -337,7 +331,6 @@ export function createMcpServer(ctx: McpContext): McpServer {
         `View a PNG, JPEG, GIF, WebP, or SVG image from the workspace. Images are capped at ` +
         `10 MiB and sensitive-file/path policies still apply. ${UNTRUSTED_NOTE}`,
       inputSchema: { path: z.string().describe("Workspace-relative image path") },
-      outputSchema: readImageOutputSchema,
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
@@ -348,10 +341,9 @@ export function createMcpServer(ctx: McpContext): McpServer {
         const metadata = { path: image.path, sizeBytes: image.sizeBytes, mimeType: image.mimeType };
         return {
           content: [
-            { type: "text", text: JSON.stringify(metadata, null, 2) },
-            { type: "image", data: image.data, mimeType: image.mimeType },
+            { type: "text" as const, text: JSON.stringify(metadata, null, 2) },
+            { type: "image" as const, data: image.data, mimeType: image.mimeType },
           ],
-          structuredContent: metadata,
         };
       } catch (error) {
         return mapError(error);

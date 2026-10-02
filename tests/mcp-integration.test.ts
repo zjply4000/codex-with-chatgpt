@@ -100,7 +100,7 @@ describe("MCP tools over Streamable HTTP", () => {
     expectToolOutputSchema(tools, "workspace_info", ["workspaceId", "workspaceName", "projectType", "git"]);
     expectToolOutputSchema(tools, "list_directory", ["path", "entries", "total", "hasMore"]);
     expectToolOutputSchema(tools, "read_file", ["path", "content", "startLine", "endLine", "nextStartLine"]);
-    expectToolOutputSchema(tools, "read_image", ["path", "sizeBytes", "mimeType"]);
+    expect(tools.find((tool) => tool.name === "read_image")?.outputSchema).toBeUndefined();
     expectToolOutputSchema(tools, "search_workspace", ["matches", "matchCount", "truncated", "engine"]);
     expectToolOutputSchema(tools, "git_status", ["isRepo", "branch", "staged", "unstaged", "untracked", "hidden"]);
     expectToolOutputSchema(tools, "git_diff", ["isRepo", "mode", "diff", "hasMore", "nextOffset"]);
@@ -135,15 +135,21 @@ describe("MCP tools over Streamable HTTP", () => {
   });
 
   it("read_image returns metadata and image content", async () => {
+    const { tools } = await client.listTools();
     const result = await client.callTool({ name: "read_image", arguments: { path: "pixel.png" } });
-    expect(result.structuredContent).toEqual({ path: "pixel.png", sizeBytes: 11, mimeType: "image/png" });
-    const content = result.content as { type: string; mimeType?: string }[];
-    expect(content.some((item) => item.type === "image" && item.mimeType === "image/png")).toBe(true);
+    const content = result.content as { type: string; text?: string; data?: string; mimeType?: string }[];
+    const metadataText = content.find((item) => item.type === "text")?.text;
+
+    expect(tools.find((tool) => tool.name === "read_image")?.outputSchema).toBeUndefined();
+    expect(result.structuredContent).toBeUndefined();
+    expect(metadataText).toBe(JSON.stringify({ path: "pixel.png", sizeBytes: 11, mimeType: "image/png" }, null, 2));
+    expect(content.some((item) => item.type === "image" && item.mimeType === "image/png" && item.data)).toBe(true);
   });
 
   it("read_image keeps workspace containment, sensitive-path and signature checks", async () => {
     write(root, "spoofed.png", "not an image");
-    for (const imagePath of [".env", "../outside.png", "spoofed.png"]) {
+    write(root, "unsafe.svg", '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>');
+    for (const imagePath of [".env", "../outside.png", "spoofed.png", "unsafe.svg"]) {
       const result = await client.callTool({ name: "read_image", arguments: { path: imagePath } });
       expect(result.isError).toBe(true);
       expect(textOf(result)).not.toContain("supersecret");
