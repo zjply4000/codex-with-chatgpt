@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 
 /**
@@ -18,10 +18,12 @@ export interface RuntimeState {
   adminToken: string;
   publicUrl: string | null;
   startedAt: string;
+  /** Missing on legacy records, which cannot establish instance identity. */
+  instanceId?: string;
 }
 
 export function runtimeFile(workspaceId: string): string {
-  return path.join(ensureDir(path.join(getStateDir(), "runtime")), `${workspaceId}.json`);
+  return path.join(getStateDir(), "runtime", `${workspaceId}.json`);
 }
 
 export function writeRuntimeState(state: RuntimeState): void {
@@ -45,6 +47,7 @@ export interface HealthPayload {
   version: string;
   workspaceId: string;
   status: string;
+  instanceId?: string;
 }
 
 /** Probe a port and check whether a healthy c2c bridge for the workspace answers. */
@@ -69,7 +72,20 @@ export async function probeBridge(
 export type BridgeObservation =
   | { state: "healthy"; runtime: RuntimeState }
   | { state: "stopped"; runtime: RuntimeState | null; reason: "runtime_missing" | "pid_missing" }
-  | { state: "unknown"; runtime: RuntimeState | null; reason: "probe_failed" | "pid_unknown" | "workspace_mismatch" };
+  | { state: "unknown"; runtime: RuntimeState | null; reason: "probe_failed" | "pid_unknown" | "workspace_mismatch" | "stale_runtime" };
+
+/** Instance identity is public metadata, never an admin credential. */
+export function matchesBridgeInstance(runtime: RuntimeState, health: HealthPayload): boolean {
+  return runtime.service === SERVICE_NAME && health.service === SERVICE_NAME &&
+    runtime.workspaceId === health.workspaceId &&
+    typeof runtime.instanceId === "string" && runtime.instanceId.length > 0 &&
+    runtime.instanceId === health.instanceId;
+}
+
+export const BRIDGE_RUNTIME_REPAIR_MESSAGE =
+  "连接仍可能在运行，但本地运行记录已失效或无法验证实例身份，不能自动恢复管理权限。" +
+  "请在目标工作目录执行 c2c bridge recover；可先用 c2c bridge recover --dry-run 查看只读计划。" +
+  "命令无法安全验证旧进程时需要人工维护；不要绕过验证、启动第二实例、重新配对或重建 ChatGPT Connector。";
 
 function observePid(pid: number): "present" | "missing" | "unknown" {
   if (!Number.isInteger(pid) || pid <= 0) return "unknown";
@@ -91,10 +107,18 @@ export async function findBridgeObservation(workspaceId: string): Promise<Bridge
 
   const health = await probeBridge(runtime.port);
   if (health && health.workspaceId === workspaceId) {
+    if (!matchesBridgeInstance(runtime, health)) {
+      return { state: "unknown", runtime, reason: "stale_runtime" };
+    }
     return { state: "healthy", runtime };
   }
   if (health) {
     return { state: "unknown", runtime, reason: "workspace_mismatch" };
+  }
+
+  // A legacy record cannot identify which process its saved PID belonged to.
+  if (typeof runtime.instanceId !== "string" || !runtime.instanceId) {
+    return { state: "unknown", runtime, reason: "stale_runtime" };
   }
 
   const pid = observePid(runtime.pid);

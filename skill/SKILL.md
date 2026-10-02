@@ -60,7 +60,7 @@ whatever data it needs by itself.
      with an explicit "我愿意承担影响" may you proceed in their browser; otherwise
      keep ChatGPT in the built-in browser, every time they ask.
 6. Conversation reuse depends on `c2c session --json` → `conversation.mode`
-   (see Conversation management). Do not invent a second mode.
+   (see Conversation management). Do not invent a third mode.
    - **long-chat** (legacy session file, or the user opted out): ONE ChatGPT
      conversation per workspace. Never silently start a new chat.
    - **project** (new workspaces, or an existing workspace that opted in):
@@ -69,6 +69,8 @@ whatever data it needs by itself.
      conversation opens a new chat from the Project collection page — never
      `goto` `https://chatgpt.com/` to create it, and never reuse another
      Codex conversation's chat URL just because `session.url` exists.
+     Only explicit user intent plus one existing Project chat URL may use
+     **Adopt existing Project chat** below. Adopt is an action in project mode.
    Each workspace also has exactly ONE ChatGPT connector. Do not create a
    second connector for the same workspace. Other workspaces may have their
    own connectors — never edit those.
@@ -88,9 +90,13 @@ whatever data it needs by itself.
    - `chatgptRepair.needed` is true (fix the connector first, then doctor again)
    - `namedRepair.needed` is true (user must log in to Cloudflare, then doctor again.
      Do not Delete the ChatGPT connector — the address did not change)
+   - `bridgeRepair.needed` is true: follow **Workflow: bridge runtime repair**
+     before any named / ChatGPT repair. A live instance with an untrusted record
+     is not a stopped Bridge or a reclaimed connector address.
    - `report.bridge` says 状态无法确认: the local bridge may still be running.
      Do not `c2c start`, do not Delete the connector, do not treat it as
-     `chatgptRepair`. Wait and run doctor again.
+     `chatgptRepair`. If `bridgeRepair.needed` is false, wait and run doctor
+     again; otherwise follow the explicit runtime repair branch.
    If doctor is already green and `chatgptRepair.needed` is false, do not
    `c2c restart`, do not start a second tunnel, and do not Delete the
    connector. ChatGPT/IAB-only errors are not permission to churn the
@@ -131,6 +137,9 @@ that close the tab, hide the window, or stall on the settings page.
      the chat already bound in THIS Codex conversation)
    - Saved Project collection: `conversation.projectUrl`
      (`https://chatgpt.com/g/g-p-…/project`)
+   - Explicit adopt candidate: the user's strictly validated
+     `https://chatgpt.com/g/<project>/c/<chat>` URL, only through
+     **Adopt existing Project chat** below
    Never click Reconnect / Refresh on an existing connector. The old address is
    dead and that page hangs on "This site cannot be reached". When the address
    changed: Delete THIS workspace's `connectorName` only, then create it again
@@ -149,7 +158,9 @@ that close the tab, hide the window, or stall on the settings page.
    cannot become Chat. On every NEW conversation, if a Chat/Work switcher is
    visible (often top-left), confirm **Chat** is selected before the boot
    prompt. If it is Work, do not continue there — Switch to a new Chat
-   conversation (HANDOFF). If no switcher is visible, do not hunt menus; continue.
+   conversation (HANDOFF). For an explicit adopt candidate, reject Work
+   instead; do not switch, convert it, or create a substitute chat.
+   If no switcher is visible, do not hunt menus; continue.
    Send the boot prompt and the workspace_info check in that Chat conversation.
    Confirm the reply names the current workspace **before** saving or replacing
    the session URL. If validation fails, keep the old saved URL. Do not open a
@@ -197,7 +208,7 @@ that close the tab, hide the window, or stall on the settings page.
 ## Daily update check
 
 At the START of every workflow below (before anything else), run these two
-commands (both are cheap / cached; never mention them unless an update exists):
+commands (local safety checks always run; network checks are cached):
 
 1. `c2c update-check --json` (do not pass `-w`)
 2. `c2c sandbox-allow --json` (do not pass `-w`) — writes the C2C state directory into Codex's
@@ -206,24 +217,61 @@ commands (both are cheap / cached; never mention them unless an update exists):
    `~/.codex/config.toml` on both, or `%USERPROFILE%\.codex\config.toml` on Windows).
    If already allowlisted, this is a no-op and does not trigger elevation.
 
-- `{ "updateAvailable": false }` → continue silently. Never mention the check.
-- `{ "updateAvailable": true }` → tell the user one line:
+- The checker uses this checkout's current branch and its configured upstream,
+  never a remote's default branch. It checks dirty status before reading cache.
+  Cache identity includes checkout, branch, upstream, HEAD, remote binding and
+  the current upstream tracking commit; changing any of these invalidates it.
+- `working_tree_dirty`, `local_ahead`, `diverged`, `no_upstream`, or `detached`
+  → skip automatic update and continue the user's original task. Dirty/ahead
+  may be skipped silently. Do not announce a new version or enter update.
+  All other blocked, unavailable, or failed checks also skip update and continue.
+- Only `updateAvailable: true`, `autoUpdateEligible: true`,
+  `updateBlocked: false`, and `reason: "behind"` mean clean + behind-only.
+  Revalidate through the update workflow below before announcing or updating.
+- After that fresh preflight confirms eligibility, tell the user one line:
   "检测到 Codex with ChatGPT 有新版本，我先更新一下（约 1 分钟），随后继续你的任务。"
   Then run the update workflow below, and CONTINUE the original task afterwards.
 
 ## Workflow: update（"更新 Codex with ChatGPT"，or triggered by the daily check）
 
-Inside the checkout directory (see Locations):
+Inside the checkout directory (see Locations), for both automatic updates and
+an explicit user request to update C2C:
 
-1. `git pull --ff-only` (if it fails due to local edits: `git stash && git pull --ff-only`).
-2. `corepack pnpm install && corepack pnpm build`.
-3. Re-install the Skill: copy `skill/SKILL.md` to
+1. Run a fresh `c2c update-check --force --json`. Require all of:
+   `autoUpdateEligible: true`, `updateAvailable: true`, `updateBlocked: false`,
+   `reason: "behind"`, a clean checkout, a non-detached branch with configured
+   upstream, `ahead == 0`, `behind > 0`, and verified fast-forward ancestry.
+   A daily cached positive result alone is never permission to pull.
+   If any condition fails, skip update and continue the original task.
+   For dirty state, at most once say:
+   "Codex with ChatGPT checkout 有本地修改，自动更新已跳过。"
+2. Immediately recheck `git status --porcelain` in this exact checkout and
+   confirm branch, HEAD and configured upstream still match the fresh result,
+   including `upstreamRemote`, `upstreamBranch`, `upstreamRef` and the SHA-256
+   `remoteIdentity` of the configured fetch URL (the checker never prints that
+   URL; for local upstream remote `.`, hash the canonical checkout path).
+   A changed remote binding must skip update even when its name is unchanged.
+   If they changed or status is nonempty, skip update and continue the task.
+   Never stash, reset, clean, switch branches or overwrite local changes to
+   enable an update, even when the user explicitly requested an update.
+3. Only after those checks, `git pull --ff-only` from the current configured
+   upstream. If pull fails, stop this update; do not attempt fallback commands.
+   Preserve the checkout and continue the user's original task.
+4. `corepack pnpm install && corepack pnpm build`. If either fails, report the
+   failed update step; do not claim completion or discard local files.
+5. Re-install the Skill: copy `skill/SKILL.md` to
    `~/.codex/skills/codex-with-chatgpt/SKILL.md`, then fix the "checkout lives at:"
    line in the copy to the actual checkout path.
-4. `c2c sandbox-allow --json` (so existing installs pick up the sandbox allowlist),
-   then `c2c restart -w <workspace>` so the bridge runs the new code, then
-   `c2c update-check --force --json` to refresh the cache (should now report up to date).
-5. Tell the user "✓ 已更新到最新版本" — then resume whatever task triggered this.
+6. `c2c sandbox-allow --json`, then `c2c doctor -w <workspace> --json`.
+   Respect the existing Doctor gate and controlled bridge runtime repair rules.
+   Only a verified manageable Bridge may use `c2c restart -w <workspace>`;
+   untrusted runtime requires the existing controlled recover workflow.
+   Run doctor again after restart/recovery. Update itself never authorizes
+   Connector deletion, pairing or Project instruction changes. Only a separate
+   `chatgptRepair.needed` from the resulting doctor enters connector repair.
+7. Refresh the update cache with `c2c update-check --force --json`.
+   Tell the user "✓ 已更新到当前分支 upstream" only after build and connection
+   verification succeed, then resume whatever task triggered this.
    (The updated SKILL.md takes effect from the next Codex session; that's expected.)
 
 ## Connection choice (once per workspace)
@@ -418,6 +466,10 @@ One ChatGPT Project per workspace. Mapping:
 
 **Open a chat in this Codex thread**
 
+- If the user explicitly asks to adopt / 接管 / use an existing chat as context
+  and supplies a Project chat URL, follow **Adopt existing Project chat** first.
+  A URL alone is not adopt intent. Do not use ordinary checkpoint recovery for
+  that request; validation must complete before any session change or new INIT.
 - If you already saved a ChatGPT chat URL earlier in THIS Codex conversation:
   `goto` that URL. Continue. No new chat. No HANDOFF.
 - Else if `conversation.projectReady`: `goto` `conversation.projectUrl`.
@@ -441,6 +493,84 @@ If the collection 404s or the new chat is not inside the Project, same choice.
 **Saved chat 404s** (this thread): `goto` the collection, open a new chat
 there, boot + HANDOFF from `session.checkpoint` (no logs) + workspace_info,
 then save the new chat URL. Keep `--project-url`.
+
+### Adopt existing Project chat (explicit context adoption only)
+
+Enter ONLY when the user clearly asks to adopt / 接管 / 使用这个已有 Chat /
+用这个会话作为上下文 and supplies one Project chat URL. Merely mentioning
+any ChatGPT URL does not trigger adopt. If there are multiple candidates, ask
+the user to select exactly one; do not guess or proceed with adoption.
+An explicit adopt request with an invalid URL fails; do not silently fall
+back to ordinary new-chat or checkpoint recovery behavior.
+
+1. Run **Daily update check** (update-check and sandbox-allow), then the coding
+   workflow's tunnel / Connection choice / doctor gate as usual. Do not open
+   the candidate or send any new INIT until the gate is green. Defer task-id
+   generation and checkpoint recovery while this adopt request is pending.
+   If connector repair is needed, perform only reconnect's connector settings
+   repair and follow-up doctor gate, then return here. Skip its ordinary saved
+   chat recovery, HANDOFF, replacement-chat creation and session URL writes.
+2. `c2c session -w <workspace> --json`. Require `conversation.mode === "project"`
+   and `conversation.projectReady === true`, with a valid existing
+   `session.projectUrl`. If unbound, reject adopt and use the existing
+   **Bind Project** flow before retrying; never derive a new Project binding
+   from the supplied chat URL. Do not switch long-chat mode through adopt.
+3. Validate using the URL semantics in `src/session/state.ts`:
+   - HTTPS, hostname exactly `chatgpt.com` or `www.chatgpt.com`; normalize to
+     `https://chatgpt.com`. No credentials or non-default port.
+   - Path exactly `/g/<project>/c/<chat>`, with nonempty opaque segments.
+     Strip query, hash, and trailing `/`; retain segment spelling and case.
+     Slugs and hyphens are valid. Reject `/c/<chat>`, a collection
+     `/g/<project>/project`, extra path segments, and other hosts.
+   - Compare the candidate's project route with the route from the bound
+     collection URL by exact string equality. A mismatch fails before navigation.
+4. Claim the current unique IAB ChatGPT tab, keep it foreground, and
+   `markHandoff` at the start and end of the turn. Directly `goto` the validated
+   candidate URL on that tab (skip goto if already there). No second ChatGPT
+   tab and no Computer Use. Confirm the actual page remains the specified
+   Project chat; a redirect to another chat or Project fails validation.
+   Handle Retry-only using **In-app browser** §7 on the same tab, but return
+   to this exact candidate for validation. Never adopt the recovery chat,
+   create a replacement, or persist anything if the candidate remains unavailable.
+5. Confirm Chat mode using **In-app browser** §7. If the actual conversation
+   is Work, reject adopt; do not convert it, switch to a new chat, or modify
+   the session. Do not send the boot prompt or INIT to a Work conversation.
+6. In this candidate chat, call `workspace_info` through the Project's exact
+   `session.connectorName`. If the connector name is missing, stop. Ask:
+   `Use ONLY connector "<connectorName>" to call workspace_info and return
+   workspaceName. This is a connection check, not continuation of an earlier
+   task. Do not plan yet.` Wait per **In-app browser** §8, reading only the
+   new verification reply. Require returned `workspaceName` to equal the
+   current workspaceName. Failure, inability to verify, or a different
+   workspace means stop; never substitute another connector.
+7. ONLY after Project, Chat mode, and workspace verification all pass:
+   `c2c session adopt -w <workspace> --url "<normalized candidate>" --json`.
+   Require `ok: true`. This preserves project mode, projectUrl and connectorName;
+   replaces url; clears title, taskId, iteration, lastState and checkpoint;
+   updates savedAt. The CLI validates local URL/binding only; it does not
+   perform browser or workspace_info checks. Re-read the returned session
+   instead of using the pre-adopt snapshot or its checkpoint.
+8. Bind this URL to THIS Codex conversation. If needed, send the existing
+   `docs/protocol.md` Boot Prompt to establish the current protocol. Always
+   generate a fresh `c2c_<random>` TASK_ID after successful adopt; do not
+   reuse an old checkpoint id or iteration. Proceed to coding workflow step 2
+   to send STATE INIT / ITERATION 0 exactly once using the adopted INIT
+   template in `docs/protocol.md`, then perform its visibility/checkpoint
+   checks and continue with steps 3 onward.
+
+Adopt takes only conversation context. Never scan historical `[C2C]` messages
+or read chat DOM to extract old TASK_ID, ITERATION, PLAN, EXECUTED, DONE or
+BLOCKED, infer protocol state, or decide whether a previous task finished.
+Earlier C2C, Codex, Antigravity and other coding-agent collaboration is
+natural conversation context for ChatGPT only. Do not send HANDOFF for that
+history, do not resume it, and do not add `STATE: RESUME` or mode `adopt`.
+After the new INIT, process only replies for the new active TASK_ID.
+
+On any adopt verification failure: keep the original session URL and checkpoint,
+do not run session adopt/set/clear, do not send a new INIT, and explain the
+specific reason clearly. A later NEW Codex conversation still creates a new
+chat from the bound collection: project `reuseSavedChat` stays false, and a
+saved adopted URL alone never authorizes reuse in another thread.
 
 ### Bind Project (user creates the collection once)
 
@@ -525,11 +655,16 @@ ChatGPT's replies are expected to be substantive (see step 3). Docs: `docs/proto
    again. If `chatgptRepair.needed` is true, tell the user `chatgptRepair.userMessage`
    (one paragraph, no internals), run **Workflow: reconnect after address
    reclaim**, then doctor again and only continue when the gate is green.
-   Generate task id: `c2c_` + 4 random hex chars — unless a checkpoint already
-   has one (reuse that id; do not mint a second task).
+   For explicit adopt intent, defer task-id generation and checkpoint recovery
+   to **Adopt existing Project chat**. Otherwise generate task id: `c2c_` +
+   4 random hex chars — unless a checkpoint already has one (reuse that id;
+   do not mint a second task).
 1. `c2c session -w <workspace> --json`. Open ChatGPT on the same iab tab
    per **Conversation management** for `conversation.mode` (foreground +
-   markHandoff). long-chat: saved chat, or `https://chatgpt.com/` if none.
+   markHandoff). Explicit adopt intent: run **Adopt existing Project chat**
+   before ordinary routing or checkpoint recovery, even when a checkpoint
+   exists. On success jump to step 2 with a new task id and cleared session;
+   on failure stop without INIT. long-chat: saved chat, or `https://chatgpt.com/` if none.
    project: this thread's chat URL, or the collection page for a new chat,
    or **Bind Project** if `projectReady` is false. On a NEW conversation
    confirm Chat mode (**In-app browser** §7), then send the boot prompt from
@@ -539,7 +674,9 @@ ChatGPT's replies are expected to be substantive (see step 3). Docs: `docs/proto
    already provides. After sending a control message, wait per
    **In-app browser** §8.
 
-   **Resume from `session.checkpoint` before any INIT.** Missing checkpoint
+   **Ordinary routing only: resume from `session.checkpoint` before any INIT.**
+   Successful explicit adopt skips this recovery and uses only its cleared
+   returned session. Missing checkpoint
    (legacy session): continue as a normal new/continued loop. A browser/js
    timeout is not a lost task — claim the original tab; do not INIT, re-run,
    or resend EXECUTED just because a wait timed out.
@@ -557,7 +694,9 @@ ChatGPT's replies are expected to be substantive (see step 3). Docs: `docs/proto
    - `BLOCKED`: surface ChatGPT's reason; do not INIT.
    Never re-pair, never recreate the connector, and never rewrite Project
    instructions just to resume.
-2. Send INIT with the user's goal (skip when the checkpoint says not to):
+2. Send INIT with the user's goal (skip when the checkpoint says not to).
+   After explicit adopt use `docs/protocol.md` §Adopted Project chat INIT
+   with its CONTEXT notice and fresh TASK_ID; otherwise use this template:
 
 ```
 [C2C]
@@ -683,7 +822,13 @@ the previous public address is gone. Doctor already started a new one.
      code. Continue as soon as it is Connected — do not wait for 8 tools on
      the settings page.
    - If the name is already gone, skip Delete and only create.
-4. `c2c doctor --json` again. Same tab: only after the Doctor gate is green,
+4. `c2c doctor --json` again. Only after the Doctor gate is green:
+   - If an explicit adopt request is pending, return directly to
+     **Adopt existing Project chat** step 2 and validate that candidate with
+     the repaired exact connector. Skip the ordinary saved-chat checks and
+     step 5 below. Do not send HANDOFF, create a substitute chat, or write
+     session URL/checkpoint before adopt validation succeeds.
+   - Otherwise continue the ordinary reconnect path on the same tab:
    reopen the chat this Codex thread was already using (`session.url` /
    the URL you saved earlier in THIS thread). Do not rewrite Project
    instructions — they store the connector **name**, which did not change.
@@ -706,6 +851,8 @@ the previous public address is gone. Doctor already started a new one.
 
 1. `c2c doctor -w <workspace> --json`. Doctor gate: do not open ChatGPT / send
    `[C2C]` until local is green, except reconnect settings pages.
+   After ANY doctor call, if `bridgeRepair.needed` is true, follow
+   **Workflow: bridge runtime repair** and stop this ordinary recovery path.
 2. If `namedRepair.needed`, tell the user `namedRepair.userMessage`, run
    `c2c tunnel login --json`, then doctor again. Do not Delete the connector.
 3. If `chatgptRepair.needed`, follow **reconnect after address reclaim**, then
@@ -713,11 +860,55 @@ the previous public address is gone. Doctor already started a new one.
 4. Otherwise apply the recovery map. Only involve the user for login / 2FA /
    CAPTCHA — one action.
 
+## Workflow: bridge runtime repair (untrusted live instance)
+
+Use when doctor returns `bridgeRepair.needed: true` with `reason: stale_runtime`
+or `admin_unavailable`. A matching workspace health response alone does not
+prove the saved instance/admin capability is valid. Legacy runtime or health
+without instanceId is deliberately unverified, even when its PID is alive.
+
+1. `automatic: false` means ordinary doctor does not perform maintenance.
+   When the user explicitly asks/allows recovery, OR this is connection recovery
+   inside the normal C2C workflow, use the controlled command:
+   - Current working directory is the canonical target workspace:
+     `c2c bridge recover --json`.
+   - Working directory differs from the target workspace:
+     `c2c bridge recover -w "<workspace>" --json`.
+   A read-only diagnostic request uses `--dry-run` instead; it does not authorize
+   execution of the termination plan. With no recovery intent/workflow, tell
+   the user `bridgeRepair.userMessage` and wait for that decision.
+2. Trust the command's strict verification outcome. It checks actual C2C serve
+   argv, canonical workspace, process creation identity and descendants before
+   retiring anything. Never bypass a blocked plan, add --force, kill a PID by
+   hand, clear runtime, copy health instanceId/adminToken into it, or start a
+   second Bridge. On `ok: false` / unsafe process identification, explain the
+   returned blocker and say manual maintenance is needed; stop automated
+   recovery. Do not retry in a restart loop or resume from another chat.
+   `dryRun: true` is a plan, not a completed recovery: report it and stop this
+   workflow even when `ok: true`. Do not turn it into real recovery or default
+   doctor automatically. Any diagnostic follow-up uses `doctor --no-fix` only.
+3. Success: run doctor again (omit `-w` when cwd is already this workspace).
+   Only a green doctor gate allows ChatGPT navigation or the original task
+   to continue. Recovery preserves auth, session, checkpoint, Project binding
+   and named tunnel state. A configured Named Tunnel reuses its existing name
+   and hostname: unchanged hostname means no Delete/Recreate connector,
+   no re-pair and no Project instruction changes. Do not provision or log in
+   merely for stale runtime. Follow existing named repair only if doctor
+   separately reports `namedRepair.needed`.
+4. Quick Tunnel may get a new URL. Respect recovery's `connectorRepairNeeded`
+   / `chatgptRepair` and the follow-up doctor report; address changes require
+   the existing reconnect flow only after local verification succeeds. Never
+   operate ChatGPT UI from the recover command, or recreate a connector just
+   because the old runtime was stale. If a new Bridge started but final
+   verification failed, preserve that reported state and stop; do not cycle
+   it again. Keep the original C2C task/checkpoint until the gate is green.
+
 ## Recovery map
 
 | Symptom | Action |
 | --- | --- |
 | Bridge not running | `c2c start` (doctor does this automatically) |
+| `bridgeRepair.needed` / `stale_runtime` / `admin_unavailable` | Follow controlled bridge runtime repair: `c2c bridge recover --json` in the target cwd (otherwise pass `-w`). Refuse unsafe identification; no force, manual PID kill, re-pair or connector recreation. |
 | Tunnel dead / URL unreachable / 全关掉后连接失效 | `c2c doctor` → if `namedRepair.needed`, login to Cloudflare and doctor again (do not Delete). If `chatgptRepair.needed`, tell the user the message, then **Delete** THIS workspace's connector only (`connectorName`) and create it again. Never Reconnect. After recreate, re-check `workspace_info` in the saved chat; if it still fails, new chat in the same Project (or long-chat switch) + HANDOFF. |
 | Collection page shows only Retry | Same iab tab: Retry once, then open the last working chat and click its Project link. Do not write INIT/EXECUTED waiting checkpoints until the message is visible. |
 | ChatGPT says tool call failed / 401 | token expired or revoked → re-pair (new pairing code + authorize) |

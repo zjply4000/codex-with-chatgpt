@@ -67,6 +67,58 @@ Inspect the connected workspace through Codex with ChatGPT MCP.
 Create an implementation plan for Codex.
 ```
 
+### Adopted Project chat INIT
+
+Explicit adoption uses an existing Project chat as context for a **new task**.
+It is an action within project mode, not a third conversation mode or task
+recovery. The default remains: same Codex conversation uses its bound chat;
+a new Codex conversation creates a new chat in the bound Project collection.
+Project `reuseSavedChat` remains false even after adoption.
+
+The user must explicitly choose one existing
+`https://chatgpt.com/g/<project>/c/<chat>` URL. The Skill validates the bound
+Project route, actual Chat mode (reject Work without conversion), and exact
+connector's `workspace_info.workspaceName` before running
+`c2c session adopt -w <workspace> --url "<chat>" --json`. The CLI validates
+the local session and URL only; it preserves Project binding and connector,
+and clears old taskId, iteration, lastState, checkpoint and title on success.
+Any validation failure leaves the original session and checkpoint untouched
+and sends no new INIT. Adoption never binds a new Project from the chat URL.
+
+Do not scan historical C2C messages or extract their TASK_ID, ITERATION,
+PLAN, EXECUTED, DONE or BLOCKED to infer state or completion. Earlier C2C,
+Codex, Antigravity or other agent collaboration is natural context only.
+Do not recover a historical task, send HANDOFF for it, or add `STATE: RESUME`.
+After successful adoption, generate a fresh `c2c_<random>` TASK_ID, start at
+ITERATION 0 / STATE INIT, and process only new replies for that active id.
+Use the existing Boot Prompt if needed to establish the current protocol;
+the adopted INIT always includes this short CONTEXT notice:
+
+```
+[C2C]
+STATE: INIT
+TASK_ID: c2c_f81a
+ITERATION: 0
+
+GOAL:
+<current user's task>
+
+CONTEXT:
+This is an adopted existing Project chat.
+Treat all earlier discussion, including earlier C2C messages or
+coding-agent collaboration, as historical context only.
+The active C2C workflow starts with TASK_ID c2c_f81a.
+
+INSTRUCTION:
+Inspect the current workspace through the configured connector.
+Use relevant prior discussion in this conversation as context.
+Produce a C2C PLAN message.
+```
+
+Replace both example TASK_ID values with the same newly generated id. Send
+INIT once, confirm its visibility, then save the new INIT / GPT_PLAN
+checkpoint as usual. Never consult the pre-adopt checkpoint for this task.
+
 ### PLAN (ChatGPT → Codex)
 
 ```
@@ -240,6 +292,10 @@ Rules:
     you need through MCP, and resume from NEXT_EXPECTED_STEP.
 13. If this chat sits in a ChatGPT Project, use only the connector named
     in that Project's instructions. Do not use another workspace's connector.
+14. An INIT identifying an adopted existing Project chat starts a new task
+    at iteration 0. Earlier discussion, C2C messages and agent collaboration
+    are historical context only. Follow the TASK_ID in that new INIT;
+    inspect the current workspace and produce a new PLAN.
 ```
 
 ## Project instructions

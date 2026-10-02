@@ -93,22 +93,80 @@ export function writeSession(workspaceId: string, session: SavedSession): SavedS
   return session;
 }
 
-export function normalizeProjectUrl(url: string): string | null {
+/** Project routes and chat ids are opaque path segments; keep their spelling. */
+function parseChatGPTProjectUrl(url: string): {
+  url: string;
+  projectRoute: string;
+  chatId?: string;
+} | null {
   try {
     const parsed = new URL(url.trim());
     if (parsed.hostname !== "chatgpt.com" && parsed.hostname !== "www.chatgpt.com") return null;
-    const match = parsed.pathname.match(/^\/g\/(g-p-[a-zA-Z0-9]+)\/project\/?$/);
-    if (!match) return null;
-    return `https://chatgpt.com/g/${match[1]}/project`;
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.port) return null;
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    const segments = pathname.split("/");
+    if (segments[1] !== "g" || !segments[2]) return null;
+    const projectRoute = segments[2];
+    if (segments.length === 4 && segments[3] === "project") {
+      return { url: `https://chatgpt.com${pathname}`, projectRoute };
+    }
+    if (segments.length === 5 && segments[3] === "c" && segments[4]) {
+      return { url: `https://chatgpt.com${pathname}`, projectRoute, chatId: segments[4] };
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
+export function normalizeProjectUrl(url: string): string | null {
+  const parsed = parseChatGPTProjectUrl(url);
+  return parsed && !parsed.chatId ? parsed.url : null;
+}
+
 export function projectIdFromUrl(url: string): string | null {
-  const normalized = normalizeProjectUrl(url);
-  if (!normalized) return null;
-  return normalized.match(/\/g\/(g-p-[a-zA-Z0-9]+)\/project/)?.[1] ?? null;
+  const parsed = parseChatGPTProjectUrl(url);
+  return parsed && !parsed.chatId ? parsed.projectRoute : null;
+}
+
+export function parseProjectChatUrl(url: string): {
+  url: string;
+  projectRoute: string;
+  chatId: string;
+} | null {
+  const parsed = parseChatGPTProjectUrl(url);
+  return parsed?.chatId ? { ...parsed, chatId: parsed.chatId } : null;
+}
+
+/** Adopt context only. Validation completes before constructing a fresh session. */
+export function adoptProjectChat(previous: SavedSession | null, chatUrl: string): SavedSession {
+  if (resolveConversation(previous).mode !== "project") {
+    throw new Error("adopt requires project mode; use the existing Bind Project flow first");
+  }
+  const projectRoute = previous?.projectUrl ? projectIdFromUrl(previous.projectUrl) : null;
+  if (!previous || !projectRoute) {
+    throw new Error("adopt requires a valid existing Project binding; use Bind Project first");
+  }
+  const chat = parseProjectChatUrl(chatUrl);
+  if (!chat) {
+    throw new Error("Project chat URL must look like https://chatgpt.com/g/<project>/c/<chat>");
+  }
+  if (chat.projectRoute !== projectRoute) {
+    throw new Error("chat URL does not belong to the workspace's bound Project");
+  }
+
+  const adopted: SavedSession = {
+    ...previous,
+    conversationMode: "project",
+    url: chat.url,
+    savedAt: new Date().toISOString(),
+  };
+  delete adopted.title;
+  delete adopted.taskId;
+  delete adopted.iteration;
+  delete adopted.lastState;
+  delete adopted.checkpoint;
+  return adopted;
 }
 
 export function resolveConversation(session: SavedSession | null): ConversationView {
@@ -183,7 +241,7 @@ export function mergeSession(previous: SavedSession | null, patch: SessionPatch)
   if (rawProjectUrl) {
     const normalized = normalizeProjectUrl(rawProjectUrl);
     if (!normalized) {
-      throw new Error("project URL must look like https://chatgpt.com/g/g-p-…/project");
+      throw new Error("project URL must look like https://chatgpt.com/g/<project>/project");
     }
     projectUrl = normalized;
   }

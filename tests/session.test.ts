@@ -1,18 +1,31 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  adoptProjectChat,
   clearChatPointer,
   mergeSession,
   normalizeProjectUrl,
+  parseProjectChatUrl,
   projectIdFromUrl,
   readSession,
   resolveConversation,
   writeSession,
+  type SavedSession,
 } from "../src/session/state.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
 
 const PROJECT = "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project";
+const PROJECT_ROUTE = "g-p-6ab0cb548aec8191a2f43dffeceb9bc0-sfgcdnhb";
+const SLUG_PROJECT = `https://chatgpt.com/g/${PROJECT_ROUTE}/project`;
+const PROJECT_CHAT = `https://chatgpt.com/g/${PROJECT_ROUTE}/c/6ab366a1-da08-83e8-9f68-2537a8c81cad`;
 
 describe("normalizeProjectUrl", () => {
+  it("treats project routes as opaque segments, including real slugs", () => {
+    expect(normalizeProjectUrl(`${SLUG_PROJECT}/?foo=1#context`)).toBe(SLUG_PROJECT);
+    expect(projectIdFromUrl(SLUG_PROJECT)).toBe(PROJECT_ROUTE);
+    expect(normalizeProjectUrl("https://chatgpt.com/g/opaque-project/project")).toBe(
+      "https://chatgpt.com/g/opaque-project/project"
+    );
+  });
   it("accepts the collection URL and strips extras", () => {
     expect(normalizeProjectUrl(`${PROJECT}/`)).toBe(PROJECT);
     expect(normalizeProjectUrl("https://www.chatgpt.com/g/g-p-abc123/project?foo=1")).toBe(
@@ -25,6 +38,127 @@ describe("normalizeProjectUrl", () => {
     expect(normalizeProjectUrl("https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")).toBeNull();
     expect(normalizeProjectUrl("https://chatgpt.com/")).toBeNull();
     expect(normalizeProjectUrl("https://example.com/g/g-p-abc/project")).toBeNull();
+  });
+});
+
+describe("parseProjectChatUrl", () => {
+  it.each([
+    PROJECT_CHAT,
+    `${PROJECT_CHAT}/?foo=1#context`,
+    PROJECT_CHAT.replace("chatgpt.com", "www.chatgpt.com"),
+    `  ${PROJECT_CHAT}  `,
+  ])("normalizes a Project chat URL: %s", (url) => {
+    expect(parseProjectChatUrl(url)).toEqual({
+      url: PROJECT_CHAT,
+      projectRoute: PROJECT_ROUTE,
+      chatId: "6ab366a1-da08-83e8-9f68-2537a8c81cad",
+    });
+  });
+
+  it("preserves opaque project and chat segments without decoding or folding case", () => {
+    expect(parseProjectChatUrl("https://chatgpt.com/g/Project-%41/c/Chat-id_%42")).toEqual({
+      url: "https://chatgpt.com/g/Project-%41/c/Chat-id_%42",
+      projectRoute: "Project-%41",
+      chatId: "Chat-id_%42",
+    });
+  });
+
+  it.each([
+    "https://chatgpt.com/c/chat",
+    SLUG_PROJECT,
+    PROJECT_CHAT.replace("chatgpt.com", "example.com"),
+    PROJECT_CHAT.replace("chatgpt.com", "chatgpt.com.example.com"),
+    PROJECT_CHAT.replace("https:", "http:"),
+    PROJECT_CHAT.replace("https:", "ftp:"),
+    PROJECT_CHAT.replace("chatgpt.com", "user@chatgpt.com"),
+    PROJECT_CHAT.replace("chatgpt.com", "chatgpt.com:444"),
+    "https://chatgpt.com/g//c/chat",
+    "https://chatgpt.com/g/project/c/",
+    "https://chatgpt.com/g/project/c/chat/extra",
+    "https://chatgpt.com/g/project//c/chat",
+    "not a URL",
+  ])("rejects a URL outside the Project chat shape: %s", (url) => {
+    expect(parseProjectChatUrl(url)).toBeNull();
+  });
+});
+
+describe("adoptProjectChat", () => {
+  function previousSession(): SavedSession {
+    return {
+      conversationMode: "project",
+      projectUrl: SLUG_PROJECT,
+      connectorName: "Codex with ChatGPT · Demo",
+      url: `https://chatgpt.com/g/${PROJECT_ROUTE}/c/old`,
+      title: "Old chat title",
+      taskId: "c2c_old",
+      iteration: 7,
+      lastState: "EXECUTED",
+      checkpoint: {
+        taskId: "c2c_old",
+        iteration: 7,
+        protocolState: "EXECUTED_SENT",
+        waitingFor: "GPT_REVIEW",
+        originalGoal: "old task",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      savedAt: "2026-01-01T00:00:00.000Z",
+    };
+  }
+
+  it("adopts only the chat context, dropping all old task fields and title", () => {
+    const previous = previousSession();
+    const snapshot = structuredClone(previous);
+    Object.freeze(previous.checkpoint);
+    Object.freeze(previous);
+    const next = adoptProjectChat(previous, `${PROJECT_CHAT}/?foo=1#context`);
+    expect(next).toEqual({
+      conversationMode: "project",
+      projectUrl: SLUG_PROJECT,
+      connectorName: previous.connectorName,
+      url: PROJECT_CHAT,
+      savedAt: expect.any(String),
+    });
+    expect(next.savedAt).not.toBe(previous.savedAt);
+    expect(Number.isNaN(Date.parse(next.savedAt))).toBe(false);
+    expect(previous).toEqual(snapshot);
+    expect(next).not.toBe(previous);
+    // A later Codex conversation must still create its own chat in the collection.
+    expect(resolveConversation(next).reuseSavedChat).toBe(false);
+  });
+
+  it("retains the exact existing binding and accepts an inferred Project mode", () => {
+    const previous = previousSession();
+    delete previous.conversationMode;
+    previous.projectUrl = `${SLUG_PROJECT.replace("chatgpt.com", "www.chatgpt.com")}/?foo=1`;
+    const next = adoptProjectChat(previous, PROJECT_CHAT);
+    expect(next.conversationMode).toBe("project");
+    expect(next.projectUrl).toBe(previous.projectUrl);
+    expect(next.connectorName).toBe(previous.connectorName);
+  });
+
+  it.each([
+    { url: "https://chatgpt.com/g/different-project/c/chat", error: /bound Project/ },
+    { url: PROJECT_CHAT.replace(PROJECT_ROUTE, PROJECT_ROUTE.toUpperCase()), error: /bound Project/ },
+    { url: "https://chatgpt.com/c/chat", error: /Project chat URL/ },
+    { url: SLUG_PROJECT, error: /Project chat URL/ },
+    { url: PROJECT_CHAT.replace("chatgpt.com", "example.com"), error: /Project chat URL/ },
+  ])("rejects invalid or mismatched chats without mutating the session: $url", ({ url, error }) => {
+    const previous = previousSession();
+    const snapshot = structuredClone(previous);
+    expect(() => adoptProjectChat(previous, url)).toThrow(error);
+    expect(previous).toEqual(snapshot);
+  });
+
+  it.each([
+    null,
+    { conversationMode: "project", savedAt: "old" },
+    { conversationMode: "project", projectUrl: "https://chatgpt.com/c/chat", savedAt: "old" },
+    { conversationMode: "long-chat", projectUrl: SLUG_PROJECT, savedAt: "old" },
+    { url: "https://chatgpt.com/c/legacy", savedAt: "old" },
+  ] satisfies (SavedSession | null)[])("requires an existing valid Project binding: %j", (previous) => {
+    const snapshot = structuredClone(previous);
+    expect(() => adoptProjectChat(previous, PROJECT_CHAT)).toThrow();
+    expect(previous).toEqual(snapshot);
   });
 });
 
@@ -75,6 +209,16 @@ describe("resolveConversation", () => {
 });
 
 describe("mergeSession", () => {
+  it("binds a Project with a real slug before any chat exists", () => {
+    const next = mergeSession(null, {
+      conversationMode: "project",
+      projectUrl: `${SLUG_PROJECT}/?foo=1#context`,
+      connectorName: "Codex with ChatGPT · Demo",
+    });
+    expect(next.projectUrl).toBe(SLUG_PROJECT);
+    expect(next.url).toBeUndefined();
+    expect(resolveConversation(next)).toMatchObject({ mode: "project", projectReady: true, reuseSavedChat: false });
+  });
   it("keeps Project fields when only the chat URL is updated", () => {
     const next = mergeSession(
       {

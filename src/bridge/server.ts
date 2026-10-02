@@ -47,6 +47,7 @@ export interface Bridge {
   port: number;
   host: string;
   adminToken: string;
+  instanceId: string;
   authStore: AuthStore;
   pairing: PairingManager;
   tunnel: TunnelProvider;
@@ -91,6 +92,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
   const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger);
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
+  const instanceId = randomBytes(16).toString("hex");
 
   let publicBaseUrl: string | null = null;
 
@@ -108,7 +110,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   // ---- Health (public but minimal) ---------------------------------------
 
   app.get("/health", (_req, res) => {
-    res.json({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok" });
+    res.json({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok", instanceId });
   });
 
   // ---- OAuth + discovery ---------------------------------------------------
@@ -226,6 +228,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       adminToken,
       publicUrl: publicBaseUrl,
       startedAt,
+      instanceId,
     };
     writeRuntimeState(state);
   };
@@ -246,6 +249,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     port,
     host,
     adminToken,
+    instanceId,
     authStore,
     pairing,
     tunnel,

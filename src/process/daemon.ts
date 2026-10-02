@@ -3,8 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDir, getStateDir } from "../config/paths.js";
-import { findBridgeObservation, findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
+import { findBridgeObservation, findLiveBridge, matchesBridgeInstance, probeBridge, type RuntimeState } from "../bridge/runtime.js";
 import { Workspace } from "../workspace/manager.js";
+import { assertMaintenanceAccess } from "./maintenance.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -29,9 +30,11 @@ export interface EnsureBridgeResult {
  * Ensure a bridge is running for the workspace. Reuses a live instance,
  * otherwise spawns a detached daemon and waits for it to become healthy.
  */
-export async function ensureBridge(workspaceRoot: string, opts: { port?: number } = {}): Promise<EnsureBridgeResult> {
+export async function ensureBridge(workspaceRoot: string, opts: { port?: number; recoveryToken?: string } = {}): Promise<EnsureBridgeResult> {
   const workspace = new Workspace(workspaceRoot);
+  assertMaintenanceAccess(workspace.id, opts.recoveryToken);
   const observation = await findBridgeObservation(workspace.id);
+  assertMaintenanceAccess(workspace.id, opts.recoveryToken);
   if (observation.state === "healthy") return { runtime: observation.runtime, spawned: false };
   if (observation.state === "unknown") {
     throw new Error(
@@ -75,22 +78,51 @@ export async function ensureBridge(workspaceRoot: string, opts: { port?: number 
   throw new Error(`Bridge did not become healthy within 20s. See ${logFile}`);
 }
 
+export class BridgeAdminUnavailableError extends Error {
+  constructor(public readonly reason: "stale_runtime" | "admin_unavailable") {
+    super(`Bridge admin capability unavailable (${reason}); refusing unverified instance management.`);
+  }
+}
+
 export async function adminFetch<T = unknown>(
   runtime: RuntimeState,
   method: "GET" | "POST",
   route: string,
-  timeoutMs = 60_000
+  timeoutMs = 60_000,
+  recoveryToken?: string
 ): Promise<T> {
+  if (method === "POST") {
+    try { assertMaintenanceAccess(runtime.workspaceId, recoveryToken); }
+    catch { throw new BridgeAdminUnavailableError("admin_unavailable"); }
+  }
+  const health = await probeBridge(runtime.port);
+  if (!health) throw new BridgeAdminUnavailableError("admin_unavailable");
+  if (!matchesBridgeInstance(runtime, health)) throw new BridgeAdminUnavailableError("stale_runtime");
+  if (method === "POST") {
+    try { assertMaintenanceAccess(runtime.workspaceId, recoveryToken); }
+    catch { throw new BridgeAdminUnavailableError("admin_unavailable"); }
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`http://127.0.0.1:${runtime.port}${route}`, {
-      method,
-      headers: { Authorization: `Bearer ${runtime.adminToken}` },
-      signal: controller.signal,
-    });
-    const body = (await response.json().catch(() => ({}))) as T & { message?: string };
+    let response: Response;
+    try {
+      response = await fetch(`http://127.0.0.1:${runtime.port}${route}`, {
+        method,
+        headers: { Authorization: `Bearer ${runtime.adminToken}` },
+        signal: controller.signal,
+      });
+    } catch {
+      throw new BridgeAdminUnavailableError("admin_unavailable");
+    }
+    const body = (await response.json().catch(() => {
+      if (response.ok) throw new BridgeAdminUnavailableError("admin_unavailable");
+      return {};
+    })) as T & { message?: string };
     if (!response.ok) {
+      if (response.status === 401 || response.status === 403 || response.status === 404) {
+        throw new BridgeAdminUnavailableError("admin_unavailable");
+      }
       throw new Error((body as { message?: string }).message ?? `Admin request failed (${response.status})`);
     }
     return body;
@@ -101,21 +133,12 @@ export async function adminFetch<T = unknown>(
 
 export async function stopBridge(workspaceRoot: string): Promise<boolean> {
   const workspace = new Workspace(workspaceRoot);
-  const runtime = readRuntimeState(workspace.id);
-  if (!runtime) return false;
-  const healthy = await probeBridge(runtime.port);
-  if (healthy && healthy.workspaceId === workspace.id) {
-    try {
-      await adminFetch(runtime, "POST", "/admin/shutdown", 5000);
-      return true;
-    } catch {
-      // fall through to kill
-    }
+  assertMaintenanceAccess(workspace.id);
+  const observation = await findBridgeObservation(workspace.id);
+  if (observation.state === "unknown") {
+    throw new Error(`Bridge state is uncertain (${observation.reason}); refusing to stop an unverified instance.`);
   }
-  try {
-    process.kill(runtime.pid, "SIGTERM");
-    return true;
-  } catch {
-    return false;
-  }
+  if (observation.state === "stopped") return false;
+  await adminFetch(observation.runtime, "POST", "/admin/shutdown", 5000);
+  return true;
 }

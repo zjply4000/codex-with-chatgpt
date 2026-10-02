@@ -1,6 +1,4 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import path from "node:path";
-import fs from "node:fs";
 import { makeTmpDir, cleanup, makeGitRepo, write } from "./helpers.js";
 
 const spawnSyncCalls: { file: string; args: any[]; options: any }[] = [];
@@ -27,6 +25,7 @@ import { findRipgrep, resetRipgrepCache, searchWorkspace } from "../src/workspac
 import { Workspace } from "../src/workspace/manager.js";
 import { findBinary } from "../src/tunnel/detect.js";
 import { ProcessCloudflaredAccount } from "../src/tunnel/named-provision.js";
+import { checkForUpdates } from "../src/update/check.js";
 
 describe("Windows background subprocess windowsHide: true (RED verification)", () => {
   let tmpDir: string;
@@ -96,11 +95,12 @@ describe("Windows background subprocess windowsHide: true (RED verification)", (
     expect(provisionCall?.options).toHaveProperty("windowsHide", true);
   });
 
-  it("6. src/cli/index.ts update-check runGit passes windowsHide: true", () => {
-    const cliSource = fs.readFileSync(path.resolve("src/cli/index.ts"), "utf8");
-    // Verify runGit under update-check in cli/index.ts includes windowsHide: true
-    const updateCheckSection = cliSource.slice(cliSource.indexOf("// ---------------------------------------------------------------- update-check"));
-    const runGitSnippet = updateCheckSection.slice(0, updateCheckSection.indexOf("program"));
-    expect(runGitSnippet).toContain("windowsHide: true");
+  it("6. update inspection hides every background Git process", () => {
+    makeGitRepo(tmpDir);
+    spawnSyncCalls.length = 0;
+    expect(checkForUpdates({ checkout: tmpDir }).reason).toBe("no_upstream");
+    const calls = spawnSyncCalls.filter(call => call.file === "git");
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) expect(call.options).toHaveProperty("windowsHide", true);
   });
 });
