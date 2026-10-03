@@ -655,6 +655,26 @@ Do not invent `STATE: RESUME`. If the original chat is gone, send HANDOFF.
 All control messages start with `[C2C]`. Keep Codex→ChatGPT messages under 1 KB.
 ChatGPT's replies are expected to be substantive (see step 3). Docs: `docs/protocol.md`.
 
+### Local Bridge and execution-store command context
+
+Commands that must observe or write the host's active Bridge/runtime/execution
+store (`c2c status`, read-only `c2c doctor --no-fix`, `c2c record`, and
+`c2c record-check`) must use the host execution tool with
+`sandbox_permissions: require_escalated` from their first invocation whenever
+that capability is available. Use it proactively; do not wait for a sandbox
+error. This requests host access through the platform's approval path; it does
+not bypass approval and does not mean launching PowerShell with Windows
+administrator elevation.
+
+If elevated execution is unavailable or denied, stop before writing a record
+or claiming host state is verified. Ask the user to run the exact command in
+their host shell and provide its result. Do not silently fall back to sandbox
+output as authoritative. If elevated results disagree with the user's host
+output, preserve both results and stop for diagnosis; do not retry `record`,
+restart the Bridge, or infer success from a success message alone. This rule
+does not authorize Bridge recovery, restart, tunnel, pairing, or Connector
+changes; those still require the existing workflow's authorization.
+
 0. `c2c tunnel status -w <workspace> --json`. If `needsChoice`, follow
    **Connection choice** first (existing installs: ask once, then remember).
    Then `c2c doctor -w <workspace> --json` (auto-repairs). **Doctor gate:** if local
@@ -760,8 +780,9 @@ Produce a C2C PLAN message.
    `c2c record … --command "pnpm test" --output-file <temp> --exit-code <n>`
    Record both success and failure. Do not record shell history, `.env`,
    keys, or unrelated dumps. Never paste that file (or any log) into ChatGPT.
-   If the CLI says the output was not released, still send EXECUTED; ChatGPT
-   reviews from git. Immediately verify the exact task and iteration:
+   A success message from `c2c record` alone does not prove the record landed
+   in the active Bridge store. Immediately verify the exact task and iteration
+   in the same elevated host context:
    `c2c record-check -w <ws> --task <id> --iteration 1 --json`
    The command must exit 0 and return `ok: true` for the same task and
    iteration after the Bridge-side exact record check and state-store
@@ -770,8 +791,9 @@ Produce a C2C PLAN message.
    the record through `c2c record`, and verify again; do not send
    STATE: EXECUTED yet. Only after that verification:
    `c2c session set -w <ws> --iteration 1 --state EXECUTED --protocol-state EXECUTED_LOCAL --waiting-for none --next-step "send EXECUTED"`
-6. Send EXECUTED (no diffs, no logs). Tell ChatGPT to use MCP, including
-   `execution_output` when a readable item exists:
+6. Send EXECUTED (no diffs, no logs). Tell ChatGPT to independently verify the
+   exact TASK_ID + ITERATION through MCP `execution_summary` or `test_status`;
+   request `execution_output` too when a readable item exists:
 
 ```
 [C2C]
@@ -795,8 +817,14 @@ If status is restricted, ignore it and review from git_diff.
 
    Then:
    `c2c session set -w <ws> --protocol-state EXECUTED_SENT --waiting-for GPT_REVIEW --next-step "wait for PLAN or DONE"`
-7. ChatGPT reviews via MCP (`git_diff`, `read_file`, `test_status`,
-   `execution_output`) and replies DONE / PLAN (next iteration) / BLOCKED.
+7. ChatGPT reviews via MCP (`git_diff`, `read_file`, `execution_summary`,
+   `test_status`, `execution_output`) and replies DONE / PLAN (next iteration)
+   / BLOCKED. Bridge-side `record-check` proves the active Bridge store contains
+   the record; it does not prove ChatGPT MCP can read it. Do not treat the
+   execution-record chain as end-to-end verified until ChatGPT's own MCP read
+   confirms the exact TASK_ID + ITERATION. If it cannot find the record, stop
+   and diagnose the connector/session/route; do not append duplicate records to
+   mask the visibility failure.
 8. Loop. Respect maxIterations (`.c2c.json`, default 12). At the limit, pause and ask
    the user: "已完成 12 轮协作，仍有未解决问题，是否继续？"
 9. On DONE: summarize the result to the user in plain language.

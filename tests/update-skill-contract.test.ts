@@ -50,4 +50,14 @@ describe("safe automatic update Skill contract", () => {
     expect(coding).toMatch(/healthy Bridge.*execution store|Bridge-visible.*record/is);
     expect(coding).toMatch(/if it fails.*do not send/is);
   });
+  it("proactively requests host execution for Bridge and execution-store commands", () => {
+    expect(coding).toMatch(/require_escalated.*from their first invocation/is);
+    expect(coding).toMatch(/`c2c status`.*`c2c doctor --no-fix`.*`c2c record`.*`c2c record-check`/is);
+    expect(coding).toMatch(/If elevated execution is unavailable or denied.*stop.*Do not silently fall back/is);
+    expect(coding).toMatch(/If elevated results disagree.*stop/is);
+  });
+  it("keeps Bridge verification distinct from ChatGPT MCP visibility", () => {
+    expect(coding).toMatch(/Bridge-side.*does not prove ChatGPT MCP/is);
+    expect(coding).toMatch(/ChatGPT.*independent.*MCP read/is);
+  });
 });
