@@ -5,6 +5,7 @@ import { redact } from "../logger/index.js";
 import { sanitizeExecutionOutput } from "./sanitize.js";
 
 export const MAX_OUTPUT_RECORDS = 40;
+export const MAX_EXECUTION_OUTPUT_INPUT_BYTES = 256 * 1024;
 
 export interface ExecutionOutputMeta {
   id: number;

@@ -58,3 +58,8 @@ export function latestExecutionRecord(workspaceId: string): ExecutionRecord | nu
   const records = readExecutionRecords(workspaceId, 1);
   return records[records.length - 1] ?? null;
 }
+
+export function hasExecutionRecord(workspaceId: string, taskId: string, iteration: number): boolean {
+  return readExecutionRecords(workspaceId, Number.MAX_SAFE_INTEGER)
+    .some((record) => record.taskId === taskId && record.iteration === iteration);
+}

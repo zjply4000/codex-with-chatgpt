@@ -41,8 +41,13 @@ function fixture() {
   let observation: BridgeObservation = { state: "unknown", reason: "stale_runtime", runtime };
   let clock = 0;
   const events: string[] = [];
-  const inspector = { snapshot: vi.fn(async () => ({ processes: structuredClone(processes),
-    listeners: processes.some(p => p.pid === 100) ? [100] : [] })),
+  const inspector = { snapshot: vi.fn(async (port: number) => {
+    const current = structuredClone(processes);
+    const listenerOwners = current.filter(p => p.argv?.includes("serve")).map(p => ({
+      pid: p.pid, port: p.pid === 100 ? 12345 : 12345 + (p.pid % 1000),
+    }));
+    return { processes: current, listenerOwners, listeners: listenerOwners.filter(p => p.port === port).map(p => p.pid) };
+  }),
     terminate: vi.fn(async (record: ProcessRecord) => { events.push(`retire:${record.pid}`); processes = processes.filter(p => p.pid !== record.pid); }) };
   const nextRuntime = { ...runtime, pid: 200, instanceId: "new", adminToken: "new-private" };
   const deps: RecoveryDependencies = {
@@ -203,8 +208,23 @@ describe("controlled bridge recovery", () => {
     expect(f.inspector.terminate).not.toHaveBeenCalled(); expect(f.deps.start).not.toHaveBeenCalled();
   });
 
-  it("blocks an additional Node process whose argv cannot rule out a residual Bridge", async () => {
+  it("ignores an unclassified Node process listening only on an unrelated port", async () => {
     const f = fixture(); f.setProcesses([f.bridge(100), { ...f.bridge(102), argv: null }]);
+    expect(await recoverBridge(f.root, {}, f.deps)).toMatchObject({ ok: true, canRecover: true });
+    expect(f.inspector.terminate).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks an unclassified process when it owns the workspace runtime port", async () => {
+    const f = fixture();
+    const unknown = { ...f.bridge(102), argv: null };
+    f.setProcesses([f.bridge(100), unknown]);
+    const originalSnapshot = f.inspector.snapshot.getMockImplementation()!;
+    f.inspector.snapshot.mockImplementation(async (port) => {
+      const current = await originalSnapshot(port);
+      return { ...current, listeners: [100, 102], listenerOwners: [
+        { pid: 100, port: 12345 }, { pid: 102, port: 12345 },
+      ] };
+    });
     expect(await recoverBridge(f.root, {}, f.deps)).toMatchObject({ ok: false, canRecover: false });
     expect(f.inspector.terminate).not.toHaveBeenCalled();
   });
@@ -252,8 +272,8 @@ describe("controlled bridge recovery", () => {
   });
 
   it("detects changed process identity before any termination", async () => {
-    const f = fixture(); f.inspector.snapshot.mockImplementationOnce(async () => ({ processes: [f.bridge(100)], listeners: [100] }))
-      .mockImplementation(async () => ({ processes: [{ ...f.bridge(100), startId: "reused" }], listeners: [100] }));
+    const f = fixture(); f.inspector.snapshot.mockImplementationOnce(async () => ({ processes: [f.bridge(100)], listeners: [100], listenerOwners: [{ pid: 100, port: 12345 }] }))
+      .mockImplementation(async () => ({ processes: [{ ...f.bridge(100), startId: "reused" }], listeners: [100], listenerOwners: [{ pid: 100, port: 12345 }] }));
     expect(await recoverBridge(f.root, {}, f.deps)).toMatchObject({ ok: false });
     expect(f.inspector.terminate).not.toHaveBeenCalled(); expect(f.deps.start).not.toHaveBeenCalled();
   });

@@ -695,8 +695,15 @@ ChatGPT's replies are expected to be substantive (see step 3). Docs: `docs/proto
    - `EXECUTED_SENT` + `waitingFor=GPT_REVIEW`: do not INIT, do not re-run,
      do not resend EXECUTED. Stay on the saved chat and wait for review. If
      that chat 404s: HANDOFF from checkpoint fields (no logs), then wait.
-   - `EXECUTED_LOCAL`: local work is done; only send EXECUTED (record first
-     if this iteration has no record yet). Do not re-run.
+   - `EXECUTED_LOCAL`: local work is done; before sending EXECUTED, write the
+     record through `c2c record -w <workspace-root> ...` and verify the exact
+     TASK_ID + ITERATION with `c2c record-check -w <workspace-root> --task
+     <id> --iteration <n> --json`. The check must be confirmed by the healthy
+     Bridge that serves MCP and use its execution store. A CLI-only local record
+     is insufficient. If the Bridge is unavailable, stores differ without an
+     active Bridge-store binding, or the Bridge does not confirm the exact
+     record, keep `EXECUTED_LOCAL`; do not re-run completed work or send
+     EXECUTED until Bridge-visible verification succeeds.
    - `EXECUTING`: not finished. Continue the current PLAN if you still have
      it; otherwise HANDOFF and ask ChatGPT to restate the last PLAN. Do not
      treat it as done and do not INIT a new task.
@@ -743,7 +750,9 @@ Produce a C2C PLAN message.
    ChatGPT does not micro-manage tool calls).
    Before you start:
    `c2c session set -w <ws> --protocol-state EXECUTING --waiting-for none --next-step "finish PLAN then record"`
-5. Record the execution so ChatGPT can read it via MCP. Metadata always:
+5. Record the execution in the active Bridge's formal store so ChatGPT can read
+   it via MCP. `c2c record` uses the Bridge admin capability and stores any
+   associated command output in that same Bridge store. Metadata always:
    `c2c record -w <ws> --task c2c_f81a --iteration 1 --changed-files "src/a.ts,src/b.ts" --tests "27 passed" --exit-status ok`
    If this iteration ran a **test / build / lint / typecheck** command, also
    pass that command's output. Write stdout/stderr to a local temp file first,
@@ -752,7 +761,14 @@ Produce a C2C PLAN message.
    Record both success and failure. Do not record shell history, `.env`,
    keys, or unrelated dumps. Never paste that file (or any log) into ChatGPT.
    If the CLI says the output was not released, still send EXECUTED; ChatGPT
-   reviews from git. Then:
+   reviews from git. Immediately verify the exact task and iteration:
+   `c2c record-check -w <ws> --task <id> --iteration 1 --json`
+   The command must exit 0 and return `ok: true` for the same task and
+   iteration after the Bridge-side exact record check and state-store
+   fingerprint check. A CLI-local record alone is not sufficient. If it fails
+   or the pair does not match, keep the checkpoint at `EXECUTED_LOCAL`, repair
+   the record through `c2c record`, and verify again; do not send
+   STATE: EXECUTED yet. Only after that verification:
    `c2c session set -w <ws> --iteration 1 --state EXECUTED --protocol-state EXECUTED_LOCAL --waiting-for none --next-step "send EXECUTED"`
 6. Send EXECUTED (no diffs, no logs). Tell ChatGPT to use MCP, including
    `execution_output` when a readable item exists:

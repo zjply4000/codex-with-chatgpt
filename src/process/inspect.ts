@@ -9,7 +9,8 @@ export interface ProcessRecord {
   startId: string | null;
   cwd: string | null;
 }
-export interface ProcessSnapshot { processes: ProcessRecord[]; listeners: number[]; }
+export interface ProcessPortListener { port: number; pid: number; }
+export interface ProcessSnapshot { processes: ProcessRecord[]; listeners: number[]; listenerOwners?: ProcessPortListener[]; }
 export interface ProcessInspector {
   snapshot(port: number): Promise<ProcessSnapshot>;
   terminate(record: ProcessRecord): Promise<void>;
@@ -286,12 +287,89 @@ export function createProcessInspector(options: ProcessInspectorOptions = {}): P
     return unique(owners);
   }
 
+  async function allListenerOwners(processes: ProcessRecord[]): Promise<ProcessPortListener[]> {
+    if (platform === "win32") {
+      const output = (await runner("netstat.exe", ["-ano", "-p", "tcp"])).toString("utf8");
+      const owners: ProcessPortListener[] = [];
+      let rows = 0;
+      for (const line of output.split(/\r?\n/)) {
+        if (!/^\s*TCP\s/i.test(line)) continue;
+        rows++;
+        const fields = line.trim().split(/\s+/);
+        if (fields.length !== 5 || !/^\d+$/.test(fields[4])) throw inspectionError();
+        if (fields[3] !== "LISTENING") continue;
+        const portMatch = /:(\d+)$/.exec(fields[1]);
+        const pid = Number(fields[4]), port = Number(portMatch?.[1]);
+        if (!pidValid(pid) || !Number.isSafeInteger(port) || port < 1 || port > 65535) throw inspectionError();
+        owners.push({ port, pid });
+      }
+      if (output.trim() && !rows) throw inspectionError();
+      return [...new Map(owners.map((owner) => [`${owner.port}:${owner.pid}`, owner])).values()]
+        .sort((a, b) => a.port - b.port || a.pid - b.pid);
+    }
+    if (platform === "darwin") {
+      const output = (await runner("/usr/sbin/lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-FpPn"])).toString("utf8");
+      const owners: ProcessPortListener[] = [];
+      let pid: number | null = null;
+      for (const line of output.split(/\r?\n/).filter(Boolean)) {
+        if (line.startsWith("p")) {
+          const value = Number(line.slice(1));
+          if (!pidValid(value)) throw inspectionError();
+          pid = value;
+        } else if (line.startsWith("n")) {
+          const port = Number(/:(\d+)$/.exec(line.slice(1))?.[1]);
+          if (!pid || !Number.isSafeInteger(port) || port < 1 || port > 65535) throw inspectionError();
+          owners.push({ port, pid });
+        }
+      }
+      return [...new Map(owners.map((owner) => [`${owner.port}:${owner.pid}`, owner])).values()]
+        .sort((a, b) => a.port - b.port || a.pid - b.pid);
+    }
+    if (platform !== "linux") throw inspectionError();
+
+    const inodePorts = new Map<string, number>();
+    for (const filename of ["tcp", "tcp6"]) {
+      let output: Buffer;
+      try { output = await readFile(`/proc/net/${filename}`); }
+      catch (error) { if (filename === "tcp6" && missing(error)) continue; throw inspectionError(); }
+      const lines = output.toString("utf8").trim().split(/\r?\n/);
+      if (!lines[0]?.includes("local_address")) throw inspectionError();
+      for (const line of lines.slice(1)) {
+        const fields = line.trim().split(/\s+/);
+        if (fields.length < 10) throw inspectionError();
+        if (fields[3] !== "0A") continue;
+        const port = Number.parseInt(fields[1].split(":")[1] ?? "", 16);
+        if (!Number.isSafeInteger(port) || port < 1 || port > 65535 || !/^\d+$/.test(fields[9]) || fields[9] === "0") throw inspectionError();
+        inodePorts.set(fields[9], port);
+      }
+    }
+    if (!inodePorts.size) return [];
+    const owners: ProcessPortListener[] = [], found = new Set<string>();
+    for (const record of processes) {
+      let descriptors: string[];
+      try { descriptors = await readdir(`/proc/${record.pid}/fd`); } catch { continue; }
+      for (const fd of descriptors.filter((entry) => /^\d+$/.test(entry))) {
+        let target: string;
+        try { target = await readlink(`/proc/${record.pid}/fd/${fd}`); } catch { continue; }
+        const inode = /^socket:\[(\d+)\]$/.exec(target)?.[1];
+        const port = inode ? inodePorts.get(inode) : undefined;
+        if (inode && port !== undefined) { found.add(inode); owners.push({ port, pid: record.pid }); }
+      }
+    }
+    if (found.size !== inodePorts.size) throw inspectionError();
+    return [...new Map(owners.map((owner) => [`${owner.port}:${owner.pid}`, owner])).values()]
+      .sort((a, b) => a.port - b.port || a.pid - b.pid);
+  }
+
   return {
     async snapshot(port) {
       if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw inspectionError();
       try {
         const processes = await enumerate();
-        return { processes, listeners: await listeners(port, processes) };
+        const [portListeners, listenerOwners] = await Promise.all([
+          listeners(port, processes), allListenerOwners(processes),
+        ]);
+        return { processes, listeners: portListeners, listenerOwners };
       } catch { throw inspectionError(); }
     },
     async terminate(record) {

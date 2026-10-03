@@ -329,15 +329,26 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
 
     if (grantType === "refresh_token") {
       const { refresh_token: refreshToken, client_id: clientId } = body;
+      const logRefreshAttempt = (result: "success" | "invalid_request" | "invalid_grant" | "invalid_client"): void => {
+        deps.logger.info("oauth_refresh_attempt", {
+          client_id_present: Boolean(clientId),
+          result,
+          workspaceId: deps.store.workspaceId,
+          timestamp: new Date().toISOString(),
+        });
+      };
       if (!refreshToken || !clientId) {
+        logRefreshAttempt("invalid_request");
         res.status(400).json({ error: "invalid_request" });
         return;
       }
       const result = deps.store.refresh(refreshToken, clientId);
       if (!result.ok) {
+        logRefreshAttempt(result.reason === "invalid_client" ? "invalid_client" : "invalid_grant");
         res.status(400).json({ error: result.reason });
         return;
       }
+      logRefreshAttempt("success");
       res.json({
         access_token: result.tokens.accessToken,
         token_type: "Bearer",

@@ -38,11 +38,19 @@ type FetchImpl = NonNullable<CloudflaredQuickTunnelOptions["fetchImpl"]>;
 class FakeCloudflaredProcess extends EventEmitter {
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
+  readonly pid = 12345;
   exitCode: number | null = null;
   signalCode: NodeJS.Signals | null = null;
   killed = false;
-  readonly kill = vi.fn(() => {
+  readonly kill = vi.fn((signal: NodeJS.Signals) => {
     this.killed = true;
+    queueMicrotask(() => {
+      if (this.exitCode === null) {
+        this.exitCode = 0;
+        this.signalCode = signal;
+        this.emit("exit", 0, signal);
+      }
+    });
     return true;
   });
 }
@@ -182,6 +190,49 @@ describe("CloudflaredQuickTunnel", () => {
     await tunnel.stop();
   });
 
+  it("waits for the owned cloudflared child to exit before completing stop", async () => {
+    const { child, tunnel } = setupTunnel(async () => healthResponse());
+    const starting = tunnel.start(3333);
+    announceUrl(child);
+    await expect(starting).resolves.toBe(QUICK_URL);
+    let exited = false;
+    child.once("exit", () => { exited = true; });
+
+    await tunnel.stop();
+
+    expect(exited).toBe(true);
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(tunnel.status()).toMatchObject({ running: false, url: null });
+  });
+
+  it("escalates only its owned child after the graceful stop deadline", async () => {
+    const child = new FakeCloudflaredProcess();
+    child.kill.mockImplementation((signal) => {
+      child.killed = true;
+      if (signal === "SIGKILL") queueMicrotask(() => {
+        child.exitCode = 0;
+        child.signalCode = signal;
+        child.emit("exit", 0, signal);
+      });
+      return true;
+    });
+    const tunnel = new CloudflaredQuickTunnel(undefined, "cloudflared", {
+      spawnImpl: vi.fn(() => child as unknown as ChildProcess),
+      fetchImpl: vi.fn(async () => healthResponse()),
+      startTimeoutMs: 100,
+      initialHealthDelayMs: 0,
+      stopGraceMs: 1,
+      stopEscalationMs: 50,
+    });
+    const starting = tunnel.start(3333);
+    child.stderr.write(`INF ${QUICK_URL}\n`);
+    await expect(starting).resolves.toBe(QUICK_URL);
+
+    await tunnel.stop();
+
+    expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
+  });
+
   it("does not accept an HTTP 200 response from another service", async () => {
     const { child, tunnel } = setupTunnel(
       async () =>
@@ -196,6 +247,52 @@ describe("CloudflaredQuickTunnel", () => {
     expect(tunnel.status()).toMatchObject({ running: false, url: null });
   });
 
+  it("waits for a timed-out Quick Tunnel child to exit before rejecting or allowing another spawn", async () => {
+    const child = new FakeCloudflaredProcess();
+    child.kill.mockImplementation((signal) => {
+      child.killed = true;
+      if (signal === "SIGTERM") setTimeout(() => {
+        child.exitCode = 0; child.signalCode = signal; child.emit("exit", 0, signal);
+      }, 250);
+      return true;
+    });
+    const nextChild = new FakeCloudflaredProcess();
+    const spawnImpl = vi.fn().mockReturnValueOnce(child as unknown as ChildProcess)
+      .mockReturnValueOnce(nextChild as unknown as ChildProcess);
+    const tunnel = new CloudflaredQuickTunnel(undefined, "cloudflared", { spawnImpl,
+      fetchImpl: vi.fn(async () => new Response(null, { status: 503 })),
+      startTimeoutMs: 10, initialHealthDelayMs: 0, stopGraceMs: 500, stopEscalationMs: 100 });
+    const first = tunnel.start(3333);
+    announceUrl(child);
+    await vi.waitFor(() => expect(child.kill).toHaveBeenCalledWith("SIGTERM"));
+    const retry = tunnel.start(3333);
+    expect(spawnImpl).toHaveBeenCalledTimes(1);
+    await expect(first).rejects.toThrow(/timed out/i);
+    await expect(retry).rejects.toThrow(/timed out/i);
+    expect(child.exitCode).toBe(0);
+    expect(spawnImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("escalates a failed Quick Tunnel start and rejects only after its child exits", async () => {
+    const child = new FakeCloudflaredProcess();
+    child.kill.mockImplementation((signal) => {
+      child.killed = true;
+      if (signal === "SIGKILL") setTimeout(() => {
+        child.exitCode = 0; child.signalCode = signal; child.emit("exit", 0, signal);
+      }, 20);
+      return true;
+    });
+    const tunnel = new CloudflaredQuickTunnel(undefined, "cloudflared", {
+      spawnImpl: vi.fn(() => child as unknown as ChildProcess),
+      fetchImpl: vi.fn(async () => healthResponse()),
+      startTimeoutMs: 10, initialHealthDelayMs: 0, stopGraceMs: 5, stopEscalationMs: 100,
+    });
+    const starting = tunnel.start(3333);
+    await expect(starting).rejects.toThrow(/timed out/i);
+    expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(child.exitCode).toBe(0);
+  });
+
   it("does not spawn twice or resolve a stopped pending start", async () => {
     const { child, spawnImpl, tunnel } = setupTunnel(() => new Promise<Response>(() => {}));
     const starting = tunnel.start(3333);
@@ -208,6 +305,25 @@ describe("CloudflaredQuickTunnel", () => {
     await expect(concurrent).rejects.toThrow(/stopped/i);
     expect(spawnImpl).toHaveBeenCalledTimes(1);
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  it("shares failed-start cleanup with a concurrent stop call", async () => {
+    const { child, spawnImpl, tunnel } = setupTunnel(async () => new Response(null, { status: 503 }), 10);
+    child.kill.mockImplementation((signal) => {
+      child.killed = true;
+      if (signal === "SIGTERM") setTimeout(() => {
+        child.exitCode = 0; child.signalCode = signal; child.emit("exit", 0, signal);
+      }, 250);
+      return true;
+    });
+    const starting = tunnel.start(3333);
+    announceUrl(child);
+    await vi.waitFor(() => expect(child.kill).toHaveBeenCalledWith("SIGTERM"));
+    const stopping = tunnel.stop();
+    await expect(starting).rejects.toThrow(/timed out/i);
+    await stopping;
+    expect(spawnImpl).toHaveBeenCalledTimes(1);
+    expect(child.kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM"]);
   });
 
   it("does not resolve if cloudflared exits while the health probe is in flight", async () => {

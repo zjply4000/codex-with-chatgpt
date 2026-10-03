@@ -13,6 +13,7 @@ import { cleanup, makeTmpDir } from "./helpers.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliEntry = path.join(projectRoot, "src/cli/index.ts");
+const requestPath = (url: string | undefined): string => new URL(url ?? "/", "http://localhost").pathname;
 
 function runDoctor(root: string, stateDir: string, codexHome: string, noFix: boolean, json = true, extraEnv: NodeJS.ProcessEnv = {}) {
   return new Promise<{ status: number; stdout: string; stderr: string }>((resolve) => {
@@ -36,7 +37,7 @@ describe("doctor runtime identity", () => {
     const server = createServer((req, res) => {
       requests.push(`${req.method} ${req.url}`);
       res.setHeader("content-type", "application/json");
-      if (req.url === "/health") {
+      if (requestPath(req.url) === "/health") {
         res.end(JSON.stringify({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id,
           status: "ok", instanceId: "named-instance" }));
       } else if (req.url === "/admin/info" && req.headers.authorization === "Bearer named-admin") {
@@ -102,7 +103,7 @@ describe("doctor runtime identity", () => {
     const server = createServer((req, res) => {
       requests.push(`${req.method} ${req.url}`);
       res.setHeader("content-type", "application/json");
-      if (req.url === "/health") {
+      if (requestPath(req.url) === "/health") {
         res.end(JSON.stringify({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id,
           status: "ok", instanceId: "live-instance" }));
       } else if (req.url === "/admin/info" && req.headers.authorization === "Bearer test-admin") {
@@ -166,7 +167,7 @@ describe("doctor runtime identity", () => {
     const workspace = new Workspace(root);
     const server = createServer((req, res) => {
       res.setHeader("content-type", "application/json");
-      if (req.url === "/health") {
+      if (requestPath(req.url) === "/health") {
         res.end(JSON.stringify({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok", instanceId: "current-instance" }));
       } else if (req.url === "/admin/info" && req.headers.authorization === "Bearer current-token") {
         res.end(JSON.stringify({ workspaceId: workspace.id, workspaceName: workspace.name,
@@ -215,7 +216,7 @@ describe("doctor runtime identity", () => {
     const server = createServer((req, res) => {
       requests.push(`${req.method} ${req.url}`);
       res.setHeader("content-type", "application/json");
-      if (req.url === "/health") {
+      if (requestPath(req.url) === "/health") {
         res.end(JSON.stringify({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok", instanceId: healthInstance }));
       } else if (req.url === "/mcp") {
         res.writeHead(401).end("{}");

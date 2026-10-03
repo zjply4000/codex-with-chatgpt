@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 
 /**
  * State directory resolution, following OS conventions.
@@ -9,6 +10,11 @@ import fs from "node:fs";
 export function getStateDir(): string {
   const override = process.env.C2C_STATE_DIR;
   if (override && override.trim() !== "") return path.resolve(override);
+  return getDefaultStateDir();
+}
+
+/** OS-default state root shared by CLI and Bridge even when C2C_STATE_DIR differs. */
+export function getDefaultStateDir(): string {
   const home = os.homedir();
   switch (process.platform) {
     case "darwin":
@@ -20,6 +26,31 @@ export function getStateDir(): string {
       return path.join(base, "codex-with-chatgpt");
     }
   }
+}
+
+/**
+ * Runtime capabilities such as the Bridge admin token must be discoverable by
+ * CLI processes that use a different C2C_STATE_DIR. Vitest opts back into its
+ * isolated state root unless a dedicated shared test registry is provided.
+ */
+export function getRuntimeStateDir(): string {
+  const override = process.env.C2C_RUNTIME_STATE_DIR;
+  if (override && override.trim() !== "") return path.resolve(override);
+  if (process.env.VITEST || process.env.VITEST_WORKER_ID || process.env.NODE_ENV === "test") return getStateDir();
+  return getDefaultStateDir();
+}
+
+/** Hash a canonical path using the same slash and case comparison rules as pathsEquivalent. */
+export function canonicalPathFingerprint(value: string): string {
+  let canonical = path.resolve(value);
+  try {
+    canonical = fs.realpathSync.native(canonical);
+  } catch {
+    // A resolved path is still useful when the target does not exist yet.
+  }
+  const normalized = canonical.replace(/\\/g, "/").replace(/\/+$/, "");
+  const comparable = process.platform === "win32" ? normalized.toLowerCase() : normalized;
+  return createHash("sha256").update(comparable, "utf8").digest("hex").slice(0, 16);
 }
 
 export function ensureDir(dir: string): string {

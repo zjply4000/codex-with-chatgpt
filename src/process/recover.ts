@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import net from "node:net";
-import { fileURLToPath } from "node:url";
 import { Workspace } from "../workspace/manager.js";
 import { findBridgeObservation, runtimeFile, type BridgeObservation, type RuntimeState } from "../bridge/runtime.js";
 import { verifyBridgeConnection, type BridgeAdminInfo } from "../bridge/verify.js";
@@ -11,10 +10,11 @@ import { normalizeNamedTunnelHostname } from "../tunnel/cloudflared-named.js";
 import { tunnelStartRequestTimeoutMs } from "../tunnel/timeouts.js";
 import { adminFetch, BridgeAdminUnavailableError, ensureBridge, type EnsureBridgeResult } from "./daemon.js";
 import { createProcessInspector, type ProcessInspector, type ProcessRecord, type ProcessSnapshot } from "./inspect.js";
+import { bridgeWorkspaceRelation, descendantProcessTree, hasWorkspacePathCandidate, identifyBridgeProcess, processRecordFingerprint, sameBridgePath,
+  type BridgeProcessIdentity } from "./bridge-process.js";
+import { retireVerifiedBridgeTree } from "./retirement.js";
 import { acquireMaintenance } from "./maintenance.js";
 
-const checkout = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-const entries = ["dist/cli/index.js", "bin/c2c.js", "src/cli/index.ts"].map(file => path.join(checkout, file));
 const PHASES = ["plan", "retire", "clear-runtime", "start", "restore-tunnel", "verify"] as const;
 type Phase = typeof PHASES[number];
 type Verification = Awaited<ReturnType<typeof verifyBridgeConnection>>;
@@ -65,6 +65,7 @@ export interface RecoveryResult {
 interface InternalPlan {
   public: PublicPlan;
   runtime: RuntimeState | null;
+  snapshot: ProcessSnapshot | null;
   termination: ProcessRecord[];
   roots: ProcessRecord[];
   files: Map<string, string | null>;
@@ -76,73 +77,15 @@ function bytes(file: string): string | null {
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
 }
 
-function canonical(input: string, cwd: string | null): string {
-  if (!path.isAbsolute(input) && !cwd) throw new Error("relative path without process cwd");
-  return fs.realpathSync.native(path.resolve(cwd ?? "", input));
-}
+type RecoveryIdentity = BridgeProcessIdentity & { root?: string; candidate?: string; valid: boolean };
 
-function samePath(a: string, b: string): boolean {
-  if (a === b) return true;
-  if (process.platform !== "win32" && process.platform !== "darwin") return false;
-  if (a.toLowerCase() !== b.toLowerCase()) return false;
-  // Case aliases must also name the same object; hard links in another checkout do not qualify.
-  const left = fs.statSync(a), right = fs.statSync(b);
-  return left.dev === right.dev && left.ino !== 0 && left.ino === right.ino;
-}
-
-/** Recognize the actual daemon argv grammar, never workspace-name substrings. */
-function identify(record: ProcessRecord): { related: boolean; root?: string; valid: boolean } {
-  const argv = record.argv;
-  if (!argv?.length) return { related: Boolean(record.executable && /^node(?:\.exe)?$/i.test(path.basename(record.executable))), valid: false };
-  let index = 1;
-  if (argv[index] === "--import" && ["tsx", "tsx/esm"].includes(argv[index + 1])) index += 2;
-  const isEntry = (value: string) => /(?:^|\/)(?:dist\/cli\/index\.js|bin\/c2c\.js|src\/cli\/index\.ts)$/.test(value.replace(/\\/g, "/"));
-  const invocation = argv.findIndex((arg, position) => isEntry(arg) && argv[position + 1] === "serve");
-  if (invocation >= 0 && invocation !== index) return { related: true, valid: false };
-  const entry = argv[index];
-  const related = Boolean(entry && isEntry(entry));
-  if (!related || argv[index + 1] !== "serve") return { related: false, valid: false };
-  try {
-    if (!record.executable || !/^node(?:\.exe)?$/i.test(path.basename(record.executable))) return { related: true, valid: false };
-    if (!entries.some(candidate => fs.existsSync(candidate) && samePath(canonical(entry, record.cwd), fs.realpathSync.native(candidate)))) {
-      return { related: true, valid: false };
-    }
-    let workspace: string | undefined;
-    let portSeen = false;
-    for (let i = index + 2; i < argv.length; i++) {
-      const arg = argv[i];
-      if (arg === "--workspace" || arg.startsWith("--workspace=")) {
-        if (workspace !== undefined) return { related: true, valid: false };
-        workspace = arg === "--workspace" ? argv[++i] : arg.slice("--workspace=".length);
-        if (!workspace) return { related: true, valid: false };
-      } else if (arg === "--port" || arg.startsWith("--port=")) {
-        const value = arg === "--port" ? argv[++i] : arg.slice("--port=".length);
-        if (portSeen || !/^\d+$/.test(value) || Number(value) > 65535) return { related: true, valid: false };
-        portSeen = true;
-      } else return { related: true, valid: false };
-    }
-    if (!workspace) return { related: true, valid: false };
-    return { related: true, valid: true, root: new Workspace(canonical(workspace, record.cwd)).root };
-  } catch { return { related: true, valid: false }; }
+function identify(record: ProcessRecord): RecoveryIdentity {
+  const identity = identifyBridgeProcess(record);
+  return { ...identity, valid: identity.verified, root: identity.workspaceRoot, candidate: identity.workspacePathCandidate };
 }
 
 function fingerprint(record: ProcessRecord): string {
-  return JSON.stringify([record.pid, record.parentPid, record.startId, record.executable, record.argv, record.cwd]);
-}
-
-function bornAfterParent(child: ProcessRecord, parent: ProcessRecord): boolean {
-  const parse = (id: string | null): bigint | null => {
-    if (!id) return null;
-    if (/^linux:\d+$/.test(id)) return BigInt(id.slice(6));
-    if (/^darwin:\d+:\d+$/.test(id)) { const [, seconds, microseconds] = id.split(":"); return BigInt(seconds) * 1_000_000n + BigInt(microseconds); }
-    return null;
-  };
-  if (child.startId?.startsWith("windows:") && parent.startId?.startsWith("windows:")) {
-    const a = child.startId.slice(8), b = parent.startId.slice(8);
-    return !Number.isNaN(Date.parse(a)) && !Number.isNaN(Date.parse(b)) && a >= b;
-  }
-  const a = parse(child.startId), b = parse(parent.startId);
-  return a !== null && b !== null && a >= b;
+  return processRecordFingerprint(record);
 }
 
 function portIsFree(port: number): Promise<boolean> {
@@ -180,7 +123,7 @@ async function buildPlan(ws: Workspace, deps: RecoveryDependencies): Promise<Int
     reason: observation.state === "healthy" ? undefined : observation.reason }, runtime: runtime ? { pid: runtime.pid, port: runtime.port } : null,
     bridges: [], descendantCount: 0, tunnel: { mode: !hadPublic ? "local" : tunnel.preference === "named" ? "named" : "quick",
       hostname: configuredHostname, restore: hadPublic }, phases: PHASES, blockers: [] };
-  const result: InternalPlan = { public: publicPlan, runtime, termination: [], roots: [], files: new Map(), healthy: false };
+  const result: InternalPlan = { public: publicPlan, runtime, snapshot: null, termination: [], roots: [], files: new Map(), healthy: false };
   if (observation.state === "healthy") {
     try { await deps.info(observation.runtime); result.healthy = true; return result; }
     catch (error) {
@@ -196,7 +139,7 @@ async function buildPlan(ws: Workspace, deps: RecoveryDependencies): Promise<Int
     publicPlan.blockers.push("No usable workspace runtime record."); return result;
   }
   try {
-    if (runtime.workspaceId !== ws.id || !samePath(new Workspace(runtime.workspaceRoot).root, ws.root)) throw new Error("wrong binding");
+    if (runtime.workspaceId !== ws.id || !sameBridgePath(new Workspace(runtime.workspaceRoot).root, ws.root)) throw new Error("wrong binding");
   } catch { publicPlan.blockers.push("Saved runtime workspace binding cannot be verified."); return result; }
   for (const file of [runtimeFile(ws.id), endpointFile(ws.id), tunnelStateFile(ws.id)]) result.files.set(file, bytes(file));
   if (hadPublic && tunnel.preference === "named") {
@@ -211,47 +154,34 @@ async function buildPlan(ws: Workspace, deps: RecoveryDependencies): Promise<Int
   let snapshot: ProcessSnapshot;
   try { snapshot = await deps.inspector.snapshot(runtime.port); }
   catch { publicPlan.blockers.push("OS process or listener inspection is unavailable; manual maintenance is required."); return result; }
+  result.snapshot = snapshot;
   const marked = new Set([...snapshot.listeners, runtime.pid]);
   for (const record of snapshot.processes) {
     const identity = identify(record);
-    if (identity.valid && identity.root && samePath(identity.root, ws.root)) {
+    const relation = bridgeWorkspaceRelation(identity, ws.root);
+    if (relation === "other-canonical" || relation === "other-candidate") continue;
+    if (identity.valid && relation === "same-canonical") {
       if (!record.startId || !record.executable || record.pid === process.pid) publicPlan.blockers.push(`PID ${record.pid}: process birth identity cannot be safely established.`);
       else result.roots.push(record);
-    } else if (marked.has(record.pid) || (identity.related && !identity.valid)) {
+    } else if (relation === "same-candidate" || hasWorkspacePathCandidate(identity, ws.root) || marked.has(record.pid) ||
+      (identity.related && !identity.root && !identity.candidate && marked.has(record.pid))) {
       publicPlan.blockers.push(`PID ${record.pid}: C2C serve and exact workspace ownership could not be verified.`);
     }
   }
   const roots = new Set(result.roots.map(record => record.pid));
   for (const listener of snapshot.listeners) if (!roots.has(listener)) publicPlan.blockers.push(`Listener PID ${listener} is not a verified target Bridge.`);
   if (!roots.size) publicPlan.blockers.push("No strictly verified Bridge process for this workspace.");
-  const selected = new Set(roots);
-  for (let changed = true; changed;) {
-    changed = false;
-    for (const record of snapshot.processes) if (!selected.has(record.pid) && selected.has(record.parentPid)) {
-      selected.add(record.pid); changed = true;
-    }
-  }
-  result.termination = snapshot.processes.filter(record => selected.has(record.pid));
+  const tree = descendantProcessTree(snapshot, result.roots);
+  publicPlan.blockers.push(...tree.blockers);
+  result.termination = tree.records;
   const records = new Map(result.termination.map(record => [record.pid, record]));
-  const depth = new Map<number, number>();
-  const findDepth = (record: ProcessRecord, visited = new Set<number>()): number => {
-    if (depth.has(record.pid)) return depth.get(record.pid)!;
-    if (visited.has(record.pid)) { publicPlan.blockers.push("Process parentage is cyclic or unreliable."); return 0; }
-    visited.add(record.pid);
-    const parent = records.get(record.parentPid);
-    if (parent && !bornAfterParent(record, parent)) publicPlan.blockers.push(`PID ${record.pid}: parent PID may have been reused.`);
-    const value = parent ? findDepth(parent, visited) + 1 : 0;
-    depth.set(record.pid, value); return value;
-  };
-  for (const record of result.termination) findDepth(record);
   for (const record of result.termination) {
     const identity = identify(record);
     if (!record.startId || !record.executable || !record.argv?.length || record.pid === process.pid || record.parentPid === record.pid ||
-      (identity.valid && identity.root && !samePath(identity.root, ws.root))) {
+      (identity.valid && identity.root && !sameBridgePath(identity.root, ws.root))) {
       publicPlan.blockers.push(`PID ${record.pid}: descendant identity or target parentage could not be safely established.`);
     }
   }
-  result.termination.sort((a, b) => (depth.get(b.pid) ?? 0) - (depth.get(a.pid) ?? 0));
   publicPlan.descendantCount = result.termination.filter(record => !roots.has(record.pid)).length;
   const descendsFrom = (child: ProcessRecord, rootPid: number): boolean => {
     const visited = new Set<number>();
@@ -289,17 +219,10 @@ export async function recoverBridge(root: string, opts: { dryRun?: boolean } = {
       throw new Error("Plan changed before retirement");
     }
     result.phase = "retire";
-    for (const record of internal.termination) await deps.inspector.terminate(record);
-    const deadline = deps.now() + 10_000;
-    while (true) {
-      const snapshot = await deps.inspector.snapshot(internal.runtime!.port);
-      const survivors = snapshot.processes.filter(record => internal.termination.some(old => old.pid === record.pid && old.startId === record.startId));
-      const newCandidates = snapshot.processes.some(record => { const identity = identify(record); return identity.related && (!identity.valid || (identity.root && samePath(identity.root, ws.root))); });
-      if (!survivors.length && !newCandidates && !snapshot.listeners.length && await deps.portFree(internal.runtime!.port)) break;
-      if (deps.now() >= deadline) throw new Error("Verified processes or old listener did not retire");
-      await deps.pause(200);
-    }
-    result.retired = { bridges: internal.roots.length, descendants: plan.descendantCount };
+    const retired = await retireVerifiedBridgeTree({ inspector: deps.inspector, workspaceRoot: ws.root,
+      snapshot: internal.snapshot!, roots: internal.roots, assumedPort: internal.runtime!.port,
+      now: deps.now, pause: deps.pause, portFree: () => deps.portFree(internal.runtime!.port) });
+    result.retired = { bridges: retired.bridges, descendants: retired.descendants };
     result.phase = "clear-runtime";
     if (!unchangedFiles(internal, true)) throw new Error("Saved state changed during retirement");
     fs.rmSync(runtimeFile(ws.id), { force: true });

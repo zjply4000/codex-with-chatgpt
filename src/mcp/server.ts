@@ -100,6 +100,8 @@ const gitIdentityOutputSchema = z.object({
 const workspaceInfoOutputSchema = {
   workspaceId: z.string(),
   workspaceName: z.string(),
+  bridgeInstanceId: z.string(),
+  executionStoreFingerprint: z.string(),
   rootAlias: z.string(),
   projectType: z.string(),
   languages: z.array(z.string()),
@@ -183,6 +185,8 @@ const gitDiffOutputSchema = {
 
 const testStatusOutputSchema = {
   available: z.boolean(),
+  bridgeInstanceId: z.string(),
+  executionStoreFingerprint: z.string(),
   message: z.string().optional(),
   taskId: z.string().optional(),
   iteration: z.number().int().nonnegative().optional(),
@@ -195,6 +199,8 @@ const testStatusOutputSchema = {
 };
 
 const executionSummaryOutputSchema = {
+  bridgeInstanceId: z.string(),
+  executionStoreFingerprint: z.string(),
   records: z.array(executionRecordSchema),
 };
 
@@ -225,10 +231,12 @@ const executionOutputOutputSchema = {
 export interface McpContext {
   workspace: Workspace;
   logger: Logger;
+  bridgeInstanceId: string;
+  executionStoreFingerprint: string;
 }
 
 export function createMcpServer(ctx: McpContext): McpServer {
-  const { workspace } = ctx;
+  const { workspace, bridgeInstanceId, executionStoreFingerprint } = ctx;
   const server = new McpServer(
     { name: PRODUCT_NAME, version: VERSION },
     { capabilities: { tools: {} }, instructions: UNTRUSTED_NOTE }
@@ -254,6 +262,8 @@ export function createMcpServer(ctx: McpContext): McpServer {
         return okStructured({
           workspaceId: workspace.id,
           workspaceName: workspace.name,
+          bridgeInstanceId,
+          executionStoreFingerprint,
           rootAlias: "workspace:/",
           ...project,
           git: {
@@ -480,10 +490,13 @@ export function createMcpServer(ctx: McpContext): McpServer {
       if (denied) return denied;
       const latest = latestExecutionRecord(workspace.id);
       if (!latest) {
-        return okStructured({ available: false, message: "No execution records yet for this workspace." });
+        return okStructured({ available: false, message: "No execution records yet for this workspace.",
+          bridgeInstanceId, executionStoreFingerprint });
       }
       return okStructured({
         available: true,
+        bridgeInstanceId,
+        executionStoreFingerprint,
         taskId: latest.taskId,
         iteration: latest.iteration,
         tests: latest.tests,
@@ -512,7 +525,8 @@ export function createMcpServer(ctx: McpContext): McpServer {
     async (args, extra) => {
       const denied = requireScope(extra.authInfo, "execution.read");
       if (denied) return denied;
-      return okStructured({ records: readExecutionRecords(workspace.id, args.limit) });
+      return okStructured({ bridgeInstanceId, executionStoreFingerprint,
+        records: readExecutionRecords(workspace.id, args.limit) });
     }
   );
 

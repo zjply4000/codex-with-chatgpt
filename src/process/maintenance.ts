@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
-import { getStateDir } from "../config/paths.js";
+import { getRuntimeStateDir } from "../config/paths.js";
 
 function lockFile(workspaceId: string): string {
-  return path.join(getStateDir(), "maintenance", `${workspaceId}.lock`);
+  return path.join(getRuntimeStateDir(), "maintenance", `${workspaceId}.lock`);
 }
 
 export function assertMaintenanceAccess(workspaceId: string, token?: string): void {

@@ -6,6 +6,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { appendExecutionRecord } from "../src/execution/records.js";
 import { saveExecutionOutput } from "../src/execution/output.js";
+import { canonicalPathFingerprint } from "../src/config/paths.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git, isolateStateDir } from "./helpers.js";
 
 let root: string;
@@ -97,15 +98,15 @@ describe("MCP tools over Streamable HTTP", () => {
       expect(names).not.toContain(forbidden);
     }
 
-    expectToolOutputSchema(tools, "workspace_info", ["workspaceId", "workspaceName", "projectType", "git"]);
+    expectToolOutputSchema(tools, "workspace_info", ["workspaceId", "workspaceName", "bridgeInstanceId", "executionStoreFingerprint", "projectType", "git"]);
     expectToolOutputSchema(tools, "list_directory", ["path", "entries", "total", "hasMore"]);
     expectToolOutputSchema(tools, "read_file", ["path", "content", "startLine", "endLine", "nextStartLine"]);
     expect(tools.find((tool) => tool.name === "read_image")?.outputSchema).toBeUndefined();
     expectToolOutputSchema(tools, "search_workspace", ["matches", "matchCount", "truncated", "engine"]);
     expectToolOutputSchema(tools, "git_status", ["isRepo", "branch", "staged", "unstaged", "untracked", "hidden"]);
     expectToolOutputSchema(tools, "git_diff", ["isRepo", "mode", "diff", "hasMore", "nextOffset"]);
-    expectToolOutputSchema(tools, "test_status", ["available", "tests", "outputAvailable", "outputId"]);
-    expectToolOutputSchema(tools, "execution_summary", ["records"]);
+    expectToolOutputSchema(tools, "test_status", ["available", "bridgeInstanceId", "executionStoreFingerprint", "tests", "outputAvailable", "outputId"]);
+    expectToolOutputSchema(tools, "execution_summary", ["bridgeInstanceId", "executionStoreFingerprint", "records"]);
     expectToolOutputSchema(tools, "execution_output", ["action", "items", "text"]);
   });
 
@@ -120,8 +121,11 @@ describe("MCP tools over Streamable HTTP", () => {
 
   it("workspace_info returns identity and project detection", async () => {
     const result = await client.callTool({ name: "workspace_info", arguments: {} });
-    const info = structuredJsonOf<{ workspaceId: string; projectType: string; frameworks: string[]; git: { isRepo: boolean; branch: string } }>(result);
+    const info = structuredJsonOf<{ workspaceId: string; projectType: string; frameworks: string[]; git: { isRepo: boolean; branch: string };
+      bridgeInstanceId: string; executionStoreFingerprint: string }>(result);
     expect(info.workspaceId).toBe(bridge.workspace.id);
+    expect(info.bridgeInstanceId).toBe(bridge.instanceId);
+    expect(info.executionStoreFingerprint).toBe(canonicalPathFingerprint(stateDir));
     expect(info.projectType).toBe("node");
     expect(info.frameworks).toContain("React");
     expect(info.git.isRepo).toBe(true);
@@ -238,18 +242,23 @@ describe("MCP tools over Streamable HTTP", () => {
       exitStatus: "ok",
       timestamp: new Date().toISOString(),
     });
-    const summary = structuredJsonOf<{ records: { taskId: string }[] }>(
+    const summary = structuredJsonOf<{ bridgeInstanceId: string; executionStoreFingerprint: string; records: { taskId: string }[] }>(
       await client.callTool({ name: "execution_summary", arguments: {} })
     );
     expect(summary.records[0].taskId).toBe("c2c_test1");
+    expect(summary.bridgeInstanceId).toBe(bridge.instanceId);
+    expect(summary.executionStoreFingerprint).toBe(canonicalPathFingerprint(stateDir));
 
-    const status = structuredJsonOf<{ available: boolean; tests: string; outputAvailable: boolean; outputId: number | null }>(
+    const status = structuredJsonOf<{ available: boolean; tests: string; outputAvailable: boolean; outputId: number | null;
+      bridgeInstanceId: string; executionStoreFingerprint: string }>(
       await client.callTool({ name: "test_status", arguments: {} })
     );
     expect(status.available).toBe(true);
     expect(status.tests).toBe("27 passed");
     expect(status.outputAvailable).toBe(false);
     expect(status.outputId).toBeNull();
+    expect(status.bridgeInstanceId).toBe(bridge.instanceId);
+    expect(status.executionStoreFingerprint).toBe(canonicalPathFingerprint(stateDir));
   });
 
   it("returns an optional executor through both execution MCP tools", async () => {

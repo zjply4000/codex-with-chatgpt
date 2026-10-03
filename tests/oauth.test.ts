@@ -1,11 +1,14 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import path from "node:path";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
+import type { Logger } from "../src/logger/index.js";
 import { makeTmpDir, cleanup, write, isolateStateDir, pkceVerifierAndChallenge } from "./helpers.js";
 
 let root: string;
 let bridge: Bridge;
 let base: string;
+const infoLog = vi.fn();
+const testLogger = { info: infoLog, warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as unknown as Logger;
 
 const REDIRECT_URI = "http://127.0.0.1:19999/callback";
 
@@ -18,6 +21,7 @@ beforeAll(async () => {
     port: 0,
     persistRuntime: false,
     authStoreFile: path.join(makeTmpDir("auth"), "store.json"),
+    logger: testLogger,
   });
   base = bridge.localBaseUrl();
 });
@@ -307,6 +311,30 @@ describe("token enforcement on /mcp", () => {
 });
 
 describe("refresh token rotation", () => {
+  it("logs safe metadata for refresh requests that omit client_id", async () => {
+    const clientId = await registerClient();
+    const tokens = bridge.authStore.issueTokens({ clientId, scopes: ["workspace.read", "offline_access"] });
+    infoLog.mockClear();
+
+    const response = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: tokens.refreshToken! }),
+    });
+    const body = await response.text();
+
+    expect(response.status).toBe(400);
+    expect(JSON.parse(body)).toEqual({ error: "invalid_request" });
+    expect(infoLog).toHaveBeenCalledWith("oauth_refresh_attempt", {
+      client_id_present: false,
+      result: "invalid_request",
+      workspaceId: bridge.workspace.id,
+      timestamp: expect.any(String),
+    });
+    expect(JSON.stringify(infoLog.mock.calls)).not.toContain(tokens.refreshToken);
+    expect(body).not.toContain(tokens.refreshToken);
+  });
+
   it("rotates refresh tokens and invalidates the old one", async () => {
     const clientId = await registerClient();
     const { verifier, challenge } = pkceVerifierAndChallenge();
@@ -323,9 +351,17 @@ describe("refresh token rotation", () => {
       return { status: response.status, body: (await response.json()) as Record<string, string> };
     };
 
+    infoLog.mockClear();
     const rotated = await refresh(initial.body.refresh_token);
     expect(rotated.status).toBe(200);
     expect(rotated.body.refresh_token).not.toBe(initial.body.refresh_token);
+    expect(infoLog).toHaveBeenCalledWith("oauth_refresh_attempt", {
+      client_id_present: true,
+      result: "success",
+      workspaceId: bridge.workspace.id,
+      timestamp: expect.any(String),
+    });
+    expect(JSON.stringify(infoLog.mock.calls)).not.toContain(initial.body.refresh_token);
 
     const replayed = await refresh(initial.body.refresh_token);
     expect(replayed.status).toBe(400);

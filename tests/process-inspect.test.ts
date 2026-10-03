@@ -37,6 +37,7 @@ describe("OS process inspection", () => {
       { pid: 43, parentPid: -1, executable: null, argv: null, startId: null, cwd: null },
     ]);
     expect(snapshot.listeners).toEqual([42, 43]);
+    expect(snapshot.listenerOwners).toEqual([{ port: 8787, pid: 42 }, { port: 8787, pid: 43 }]);
   });
 
   it("blocks missing listener ownership and failed enumeration without exposing errors", async () => {
@@ -53,6 +54,7 @@ describe("OS process inspection", () => {
     const snapshot = await inspector.snapshot(8787);
     expect(snapshot.processes[0]).toMatchObject({ argv: ["C:\\Program Files\\node.exe", "D:\\project path\\cli.js", "serve", "--workspace", "D:\\project path", ""], startId: "windows:2026-10-02T00:00:00.1234567Z", cwd: null });
     expect(snapshot.listeners).toEqual([42]);
+    expect(snapshot.listenerOwners).toEqual([{ port: 8787, pid: 42 }]);
     expect(calls[0][1]).toContain("-EncodedCommand");
     expect(calls[1]).toEqual(["netstat.exe", ["-ano", "-p", "tcp"]]);
   });
@@ -94,9 +96,11 @@ describe("OS process inspection", () => {
     const inspector = createProcessInspector({ platform: "darwin", runner: async (command, args) => {
       calls.push([command, args]);
       if (command.endsWith("python3")) return json([{ pid: 42, parentPid: 1, executable: "/usr/bin/node", startId: "darwin:123:456", cwd: "/project path", procArgsBase64: macArgs().toString("base64") }]);
-      return Buffer.from("p42\n");
+      return Buffer.from(args.includes("-iTCP:8787") ? "p42\n" : "p42\nn*:8787\n");
     } });
-    expect((await inspector.snapshot(8787)).processes[0].argv).toEqual(["node", "/project path/cli.js", "serve", "--workspace", "/project path"]);
+    const snapshot = await inspector.snapshot(8787);
+    expect(snapshot.processes[0].argv).toEqual(["node", "/project path/cli.js", "serve", "--workspace", "/project path"]);
+    expect(snapshot.listenerOwners).toEqual([{ port: 8787, pid: 42 }]);
     expect(calls[0][1][0]).toBe("-c");
     expect(calls[0][1][1]).toContain("sysctl");
     expect(calls[1][1]).toContain("-iTCP:8787");

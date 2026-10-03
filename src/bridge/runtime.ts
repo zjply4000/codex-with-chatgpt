@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { getRuntimeStateDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 
 /**
@@ -23,22 +23,30 @@ export interface RuntimeState {
 }
 
 export function runtimeFile(workspaceId: string): string {
-  return path.join(getStateDir(), "runtime", `${workspaceId}.json`);
+  return path.join(getRuntimeStateDir(), "runtime", `${workspaceId}.json`);
 }
 
 export function writeRuntimeState(state: RuntimeState): void {
   writeSecureJson(runtimeFile(state.workspaceId), state);
+  const legacyFile = path.join(getStateDir(), "runtime", `${state.workspaceId}.json`);
+  if (legacyFile !== runtimeFile(state.workspaceId)) writeSecureJson(legacyFile, state);
 }
 
 export function readRuntimeState(workspaceId: string): RuntimeState | null {
-  return readJsonIfExists<RuntimeState>(runtimeFile(workspaceId));
+  return readJsonIfExists<RuntimeState>(runtimeFile(workspaceId)) ??
+    readJsonIfExists<RuntimeState>(path.join(getStateDir(), "runtime", `${workspaceId}.json`));
 }
 
 export function clearRuntimeState(workspaceId: string): void {
-  try {
-    fs.rmSync(runtimeFile(workspaceId), { force: true });
-  } catch {
-    // ignore
+  for (const file of new Set([
+    runtimeFile(workspaceId),
+    path.join(getStateDir(), "runtime", `${workspaceId}.json`),
+  ])) {
+    try {
+      fs.rmSync(file, { force: true });
+    } catch {
+      // ignore
+    }
   }
 }
 

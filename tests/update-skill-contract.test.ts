@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 const skill = fs.readFileSync(new URL("../skill/SKILL.md", import.meta.url), "utf8");
 const daily = skill.slice(skill.indexOf("## Daily update check"), skill.indexOf("## Workflow: update"));
 const update = skill.slice(skill.indexOf("## Workflow: update"), skill.indexOf("## Connection choice"));
+const coding = skill.slice(skill.indexOf("## Workflow: coding task"));
 
 describe("safe automatic update Skill contract", () => {
   it("contains no automatic stash command", () => {
@@ -35,5 +36,18 @@ describe("safe automatic update Skill contract", () => {
     expect(skill).toContain("## Workflow: bridge runtime repair (untrusted live instance)");
     expect(skill).toContain("c2c bridge recover --json");
     expect(skill).toContain("Never bypass a blocked plan");
+  });
+  it("requires formal record verification before the EXECUTED checkpoint or message", () => {
+    const record = coding.indexOf("`c2c record -w <ws>");
+    const verify = coding.indexOf("`c2c record-check -w <ws>");
+    const checkpoint = coding.indexOf("--state EXECUTED --protocol-state EXECUTED_LOCAL");
+    const message = coding.indexOf("6. Send EXECUTED");
+    expect(record).toBeGreaterThanOrEqual(0);
+    expect(verify).toBeGreaterThan(record);
+    expect(checkpoint).toBeGreaterThan(verify);
+    expect(message).toBeGreaterThan(checkpoint);
+    expect(coding).toMatch(/must exit 0.*ok: true/is);
+    expect(coding).toMatch(/healthy Bridge.*execution store|Bridge-visible.*record/is);
+    expect(coding).toMatch(/if it fails.*do not send/is);
   });
 });

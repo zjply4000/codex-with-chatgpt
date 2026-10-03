@@ -7,6 +7,7 @@ import { findBinary } from "./detect.js";
 import type { TunnelDoctorReport, TunnelProvider, TunnelStatus } from "./provider.js";
 import { tunnelProtocolArgs } from "./protocol.js";
 import { quickTunnelStartTimeoutMs } from "./timeouts.js";
+import { stopOwnedChildProcess } from "./child-process.js";
 
 const QUICK_TUNNEL_URL_RE = /https:\/\/[^\s|]+/gi;
 const QUICK_TUNNEL_HOST_RE = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.trycloudflare\.com$/i;
@@ -71,6 +72,8 @@ export function parseQuickTunnelUrl(line: string): string | null {
 
 export interface CloudflaredQuickTunnelOptions {
   startTimeoutMs?: number;
+  stopGraceMs?: number;
+  stopEscalationMs?: number;
   /** Delay before the first health probe, so a fresh hostname is not queried (and negatively cached) too early. */
   initialHealthDelayMs?: number;
   spawnImpl?: (
@@ -92,6 +95,8 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
   private url: string | null = null;
   private lastError: string | null = null;
   private readonly startTimeoutMs: number;
+  private readonly stopGraceMs: number;
+  private readonly stopEscalationMs: number;
   private readonly initialHealthDelayMs: number;
   private readonly spawnImpl: NonNullable<CloudflaredQuickTunnelOptions["spawnImpl"]>;
   private readonly fetchImpl: NonNullable<CloudflaredQuickTunnelOptions["fetchImpl"]>;
@@ -104,6 +109,8 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
     options: CloudflaredQuickTunnelOptions = {}
   ) {
     this.startTimeoutMs = options.startTimeoutMs ?? quickTunnelStartTimeoutMs();
+    this.stopGraceMs = options.stopGraceMs ?? 5_000;
+    this.stopEscalationMs = options.stopEscalationMs ?? 2_000;
     this.initialHealthDelayMs = options.initialHealthDelayMs ?? HEALTH_CHECK_INITIAL_DELAY_MS;
     this.spawnImpl = options.spawnImpl ?? ((command, args, spawnOptions) => spawn(command, args, spawnOptions));
     this.fetchImpl = options.fetchImpl ?? ((input, init) => fetch(input, init));
@@ -116,6 +123,7 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
   async start(localPort: number): Promise<string> {
     if (this.child && this.url) return this.url;
     if (this.starting) return this.starting;
+    if (this.child) throw new Error("CLOUDFLARED_STOP_PENDING: previous Quick Tunnel child has not exited.");
     const starting = this.startProcess(localPort);
     this.starting = starting;
     try {
@@ -154,6 +162,7 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
       let candidateUrl: string | null = null;
       let cancel: (() => void) | null = null;
       let timeout: ReturnType<typeof setTimeout> | undefined;
+      let failureCleanup: Promise<void> | null = null;
 
       const closeReaders = (): void => {
         child.stdout?.destroy();
@@ -161,14 +170,6 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
       };
 
       const isAlive = (): boolean => this.child === child;
-
-      const stopChild = (): void => {
-        try {
-          child.kill("SIGTERM");
-        } catch {
-          // The process may have exited between the state check and kill().
-        }
-      };
 
       const finish = (callback: () => void, closeOutput = true): void => {
         if (settled) return;
@@ -179,18 +180,32 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
         callback();
       };
 
-      const fail = (error: unknown): void => {
-        finish(() => {
-          stopChild();
-          if (this.child === child) {
+      const fail = (error: unknown): Promise<void> => {
+        if (failureCleanup) return failureCleanup;
+        if (settled) return Promise.resolve();
+        settled = true;
+        if (timeout) clearTimeout(timeout);
+        closeReaders();
+        const initialError = error instanceof Error ? error : new Error(String(error));
+        failureCleanup = (async () => {
+          let rejection = initialError;
+          try {
+            await stopOwnedChildProcess(child, { graceMs: this.stopGraceMs, escalationMs: this.stopEscalationMs });
+          } catch (shutdownError) {
+            const detail = shutdownError instanceof Error ? shutdownError.message : String(shutdownError);
+            rejection = new Error(`${initialError.message}; ${detail}`, { cause: initialError });
+          }
+          if (this.child === child && (child.exitCode !== null || child.signalCode !== null || child.pid === undefined)) {
             this.child = null;
             this.url = null;
           }
-          reject(error instanceof Error ? error : new Error(String(error)));
-        });
+          if (cancel && this.cancelStart === cancel) this.cancelStart = null;
+          reject(rejection);
+        })();
+        return failureCleanup;
       };
 
-      cancel = () => fail(new Error("Tunnel start stopped"));
+      cancel = () => { void fail(new Error("Tunnel start stopped")); };
       this.cancelStart = cancel;
 
       const ready = (url: string): void => {
@@ -252,7 +267,7 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
       timeout = setTimeout(() => {
         if (!settled) {
           this.logger.error(`Quick tunnel did not become ready within ${this.startTimeoutMs}ms`);
-          fail(new Error("Tunnel start timed out"));
+          void fail(new Error("Tunnel start timed out"));
         }
       }, this.startTimeoutMs);
 
@@ -277,11 +292,7 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
 
       child.on("error", (error) => {
         closeReaders();
-        if (this.child === child) {
-          this.child = null;
-          this.url = null;
-        }
-        if (!settled) fail(error);
+        if (!settled) void fail(error);
       });
       child.on("exit", (code) => {
         closeReaders();
@@ -292,7 +303,7 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
         }
         this.logger.warn(`cloudflared exited with code ${code}`);
         if (!settled) {
-          fail(
+          void fail(
             new Error(
               `cloudflared exited (code ${code}) before establishing a tunnel${this.lastError ? `: ${this.lastError}` : ""}`
             )
@@ -303,17 +314,16 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
   }
 
   async stop(): Promise<void> {
+    const starting = this.starting;
     this.cancelStart?.();
-    if (this.child) {
-      try {
-        this.child.kill("SIGTERM");
-      } catch {
-        // The process may have exited between the state check and kill().
-      }
-      this.child = null;
+    const child = this.child;
+    if (child) {
+      await stopOwnedChildProcess(child, { graceMs: this.stopGraceMs, escalationMs: this.stopEscalationMs });
+      if (this.child === child) this.child = null;
     }
     this.url = null;
     this.lastError = null;
+    await starting?.catch(() => undefined);
   }
 
   async restart(localPort: number): Promise<string> {

@@ -4,12 +4,17 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
 import { BRIDGE_RUNTIME_REPAIR_MESSAGE, findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
-import { adminFetch, BridgeAdminUnavailableError, ensureBridge, stopBridge } from "../process/daemon.js";
+import { adminFetch, BridgeAdminUnavailableError, ensureBridge, restartBridge, stopBridge } from "../process/daemon.js";
 import { recoverBridge } from "../process/recover.js";
+import { createProcessInspector } from "../process/inspect.js";
+import { discoverWorkspaceBridgeProcesses } from "../process/bridge-process.js";
+import { bridgeRuntimeMismatchGuidance } from "./doctor-guidance.js";
+import { describeBridgeProcesses, describeCloudflaredProcesses, inspectLocalCloudflared } from "../process/diagnostics.js";
 import { probeMcp, probePublicBridge, type BridgeAdminInfo as AdminInfo } from "../bridge/verify.js";
 import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
+import { inspectRemoteTunnelConnectors } from "../tunnel/remote-connectors.js";
 import {
   chooseQuickTunnel,
   hasCloudflaredCert,
@@ -28,7 +33,7 @@ import {
   TUNNEL_CHOICE_PROMPT,
 } from "../tunnel/state.js";
 import { Logger } from "../logger/index.js";
-import { getStateDir } from "../config/paths.js";
+import { canonicalPathFingerprint, DEFAULT_PORT, getStateDir } from "../config/paths.js";
 import { ensureSandboxAllowlist, getCodexConfigPath, isStateDirAllowlisted } from "../config/sandbox-allow.js";
 import { mergeUiPrefs, readUiPrefs, SETUP_MODES, type SetupMode } from "../config/ui-prefs.js";
 import {
@@ -58,8 +63,8 @@ import {
   type ProtocolState,
   type WaitingFor,
 } from "../session/state.js";
-import { appendExecutionRecord } from "../execution/records.js";
-import { saveExecutionOutput } from "../execution/output.js";
+import { hasExecutionRecord } from "../execution/records.js";
+import { readExecutionStoreBinding, writeExecutionStoreBinding } from "../execution/store-binding.js";
 import { checkForUpdates, formatUpdateCheck } from "../update/check.js";
 import { importMediaAsset } from "../media/import.js";
 import { tunnelStartRequestTimeoutMs } from "../tunnel/timeouts.js";
@@ -190,6 +195,7 @@ async function ensureBridgeAndTunnel(
   const { runtime } = await ensureBridge(workspaceRoot);
   let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
   let mcpUrl: string | null = info.publicUrl ? `${info.publicUrl}/mcp` : null;
+  let namedGatePassed = false;
   if (opts.tunnel && !info.publicUrl) {
     const binaries = detectTunnelBinaries();
     if (!binaries.cloudflared) {
@@ -201,6 +207,13 @@ async function ensureBridgeAndTunnel(
     if (!result.url) throw new Error(result.message ?? "Tunnel start failed");
     info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
     mcpUrl = `${result.url}/mcp`;
+    namedGatePassed = info.tunnel.provider === "cloudflare-named";
+  }
+  if (info.publicUrl && info.tunnel.provider === "cloudflare-named" && !namedGatePassed) {
+    const identity = await probePublicBridge(info.publicUrl, info.workspaceId, runtime.instanceId, 3);
+    if (!identity.ok) {
+      throw new Error(`${identity.detail}: public /health does not consistently identify the local Bridge; another Named Tunnel replica may be active.`);
+    }
   }
   return { runtime, info, mcpUrl };
 }
@@ -230,8 +243,14 @@ program
       port: opts.port ? parseInt(opts.port, 10) : undefined,
       logger,
     });
+    let shutdownPending = false;
     const shutdown = (): void => {
-      void bridge.close().then(() => process.exit(0));
+      if (shutdownPending) return;
+      shutdownPending = true;
+      void bridge.close().then(() => process.exit(0)).catch((error: Error) => {
+        logger.error(`Bridge shutdown remains active because an owned child did not exit: ${error.message}`);
+        shutdownPending = false;
+      });
     };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
@@ -360,10 +379,11 @@ program
   .option("--tunnel", "re-establish the secure public connection", false)
   .action(async (opts: { workspace?: string; tunnel: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
-    await stopBridge(root);
-    await new Promise((resolve) => setTimeout(resolve, 500));
     try {
-      const { info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const restarted = await restartBridge(root, { tunnel: opts.tunnel });
+      if (!restarted.runtime) throw new Error("Bridge restart did not return a verified runtime.");
+      const info = await adminFetch<AdminInfo>(restarted.runtime, "GET", "/admin/info");
+      const mcpUrl = restarted.publicUrl ? `${restarted.publicUrl}/mcp` : info.publicUrl ? `${info.publicUrl}/mcp` : null;
       check(`Bridge 已重启（${info.workspaceName}）`);
       if (mcpUrl) check(`安全连接已建立`);
     } catch (error) {
@@ -449,7 +469,8 @@ program
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace?: string; fix: boolean; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
-    const report: Record<string, { ok: boolean; detail?: string; state?: string; reason?: string }> = {};
+    const report: Record<string, { ok: boolean; detail?: string; state?: string; reason?: string;
+      available?: boolean; connectorCount?: number | null }> = {};
     const results: string[] = [];
 
     // Node
@@ -488,6 +509,7 @@ program
     // Bridge
     let runtime: RuntimeState | null = null;
     let bridgeUnknown = false;
+    let localCloudflaredIssue: string | null = null;
     let bridgeRepair: { needed: boolean; reason?: string; automatic?: false; userMessage?: string } = { needed: false };
     const requireBridgeRuntimeRepair = (reason: "stale_runtime" | "admin_unavailable"): void => {
       runtime = null;
@@ -497,12 +519,73 @@ program
     };
     if (workspace) {
       const observation = await findBridgeObservation(workspace.id);
-      if (observation.state === "healthy") {
-        runtime = observation.runtime;
+      const embeddedParentBridge = observation.state === "healthy" && observation.runtime.pid === process.ppid;
+      let discovery: Awaited<ReturnType<typeof discoverWorkspaceBridgeProcesses>> | null = null;
+      let processSnapshot: Awaited<ReturnType<ReturnType<typeof createProcessInspector>["snapshot"]>> | null = null;
+      let processInspectionFailed = false;
+      if (embeddedParentBridge) {
+        report.bridgeProcesses = { ok: true, detail: "Bridge is hosted by the invoking parent process; no daemon duplicate was found." };
+      } else {
+        try {
+          processSnapshot = await createProcessInspector().snapshot(observation.runtime?.port ?? DEFAULT_PORT);
+          discovery = await discoverWorkspaceBridgeProcesses(processSnapshot, workspace.root, {
+            assumedPort: observation.runtime?.port ?? DEFAULT_PORT,
+            runtimePid: observation.runtime?.pid,
+          });
+          if (discovery.blockers.length) {
+            report.bridgeProcesses = { ok: false, detail: `BRIDGE_IDENTITY_UNVERIFIED: ${discovery.blockers.join(" ")}` };
+            processInspectionFailed = true;
+          } else {
+            report.bridgeProcesses = describeBridgeProcesses(discovery.bridges);
+          }
+          const tunnelState = readTunnelState(workspace.id);
+          if (tunnelState.tunnelId) {
+            const cloudflared = inspectLocalCloudflared(processSnapshot, tunnelState.tunnelId, workspace.root, discovery.bridges);
+            const cloudflaredReport = describeCloudflaredProcesses(cloudflared);
+            report.cloudflared = cloudflaredReport;
+            if (!cloudflaredReport.ok) localCloudflaredIssue = cloudflaredReport.detail;
+          }
+        } catch {
+          report.bridgeProcesses = { ok: false, detail: "LOCAL_PROCESS_INSPECTION_UNAVAILABLE: cannot verify local Bridge singleton." };
+          processInspectionFailed = true;
+        }
+      }
+
+      const duplicateBridge = Boolean(discovery && discovery.bridges.length > 1);
+      if (duplicateBridge) {
+        bridgeUnknown = true;
+        report.bridge = { ok: false, state: "duplicate", reason: "DUPLICATE_BRIDGE", detail: report.bridgeProcesses?.detail };
+        bridgeRepair = { needed: true, reason: "DUPLICATE_BRIDGE", automatic: false,
+          userMessage: "Multiple verified Bridge processes serve this workspace. No process was stopped; run c2c restart after reviewing the exact process identities." };
       } else if (observation.state === "unknown") {
         bridgeUnknown = true;
         report.bridge = { ok: false, state: "unknown", reason: observation.reason, detail: `状态无法确认（${observation.reason}），未自动修复` };
         if (observation.reason === "stale_runtime") requireBridgeRuntimeRepair(observation.reason);
+      } else if (processInspectionFailed) {
+        bridgeUnknown = true;
+        report.bridge = { ok: false, state: "unknown", reason: "PROCESS_IDENTITY_UNVERIFIED", detail: report.bridgeProcesses?.detail };
+        bridgeRepair = { needed: true, reason: "PROCESS_IDENTITY_UNVERIFIED", automatic: false,
+          userMessage: "Local Bridge process identity could not be verified. No Bridge or tunnel process was changed." };
+      } else if (observation.state === "healthy") {
+        const candidate = discovery?.bridges[0];
+        const runtimeMatches = embeddedParentBridge || Boolean(candidate && candidate.record.pid === observation.runtime.pid &&
+          candidate.port === observation.runtime.port && candidate.instanceId === observation.runtime.instanceId);
+        if (runtimeMatches) runtime = observation.runtime;
+        else {
+          bridgeUnknown = true;
+          report.bridge = { ok: false, state: "unknown", reason: "BRIDGE_IDENTITY_UNVERIFIED", detail: "Healthy runtime does not match a verified local Bridge listener." };
+          bridgeRepair = { needed: true, reason: "BRIDGE_IDENTITY_UNVERIFIED", automatic: false,
+            userMessage: "The runtime health endpoint is not owned by a verified Bridge process. No repair was attempted." };
+        }
+      } else if (discovery?.bridges.length) {
+        bridgeUnknown = true;
+        const savedEndpoint = readLastEndpoint(workspace.id);
+        const hasConfiguredTunnel = readTunnelState(workspace.id).provider === "cloudflare-named" || Boolean(savedEndpoint?.publicUrl);
+        const guidance = bridgeRuntimeMismatchGuidance(workspace.root, hasConfiguredTunnel);
+        report.bridge = { ok: false, state: "duplicate", reason: "DUPLICATE_BRIDGE", detail: "运行记录与当前 Bridge 不匹配" };
+        bridgeRepair = { needed: true, reason: "DUPLICATE_BRIDGE", automatic: false,
+          userMessage: guidance };
+        report.tunnel = { ok: false, detail: "Bridge 状态未确认，跳过 Tunnel 检查" };
       } else if (opts.fix) {
         try {
           runtime = (await ensureBridge(root)).runtime;
@@ -537,6 +620,11 @@ program
       : "Codex with ChatGPT";
     const tunnelState = workspace ? readTunnelState(workspace.id) : null;
     const namedReady = tunnelState ? isNamedTunnelReady(tunnelState) : false;
+    if (tunnelState?.provider === "cloudflare-named" && tunnelState.tunnelId) {
+      const remote = inspectRemoteTunnelConnectors(tunnelState.tunnelId);
+      report.remoteTunnelConnectors = { ok: true, available: remote.available,
+        connectorCount: remote.connectorCount, detail: remote.detail };
+    }
     // Existing UUID tunnels need run credentials only. Account certificates
     // belong to explicit provisioning/account management, never this gate.
     const namedCredential = namedReady ? inspectNamedTunnelCredentials(tunnelState?.tunnelId) : null;
@@ -570,7 +658,11 @@ program
       },
     };
 
-    if (runtime) {
+    if (runtime && localCloudflaredIssue) {
+      report.tunnel = { ok: false, detail: localCloudflaredIssue };
+      if (namedReady) namedRepair = { needed: true,
+        userMessage: "本地 cloudflared 归属不唯一；doctor 不会清理远端 replica。先安全检查本机进程树，再重新运行 doctor。" };
+    } else if (runtime) {
       try {
         let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
         if (namedReady && !namedCredentialFailure && opts.fix && info.tunnel.provider !== "cloudflare-named") {
@@ -589,7 +681,11 @@ program
         let currentUrl = info.publicUrl ?? info.tunnel.url;
         let healthy = false;
         if (currentUrl) {
-          healthy = (await probePublicBridge(currentUrl, workspace!.id, runtime.instanceId)).ok;
+          const publicProbe = await probePublicBridge(currentUrl, workspace!.id, runtime.instanceId, namedReady ? 3 : 1);
+          healthy = publicProbe.ok;
+          if (!publicProbe.ok && publicProbe.detail?.startsWith("PUBLIC_INSTANCE")) {
+            report.tunnel = { ok: false, detail: publicProbe.detail };
+          }
         }
 
         if ((!currentUrl || !healthy) && !namedCredentialFailure && opts.fix && (expectedPublic || info.tunnel.running)) {
@@ -674,17 +770,17 @@ program
         requireBridgeRuntimeRepair(error instanceof BridgeAdminUnavailableError ? error.reason : "admin_unavailable");
         report.tunnel = { ok: false, detail: "Bridge 管理权限无法验证，未执行连接器修复" };
       }
-    } else if (bridgeUnknown) {
-      report.tunnel = report.tunnel ?? { ok: false, detail: "Bridge 状态无法确认，未执行连接器修复" };
     } else if (namedCredentialFailure && namedCredential) {
       report.tunnel = {
         ok: false,
         detail: `NAMED_TUNNEL_CREDENTIAL_${namedCredential.status.toUpperCase()}`,
       };
       namedRepair = {
-        needed: true,
+        needed: bridgeRepair.reason !== "stale_runtime",
         userMessage: namedTunnelCredentialRepairMessage(namedCredential.status),
       };
+    } else if (bridgeUnknown) {
+      report.tunnel = report.tunnel ?? { ok: false, detail: "Bridge 状态无法确认，未执行连接器修复" };
     } else if (namedReady) {
       report.tunnel = { ok: false, detail: "NAMED_TUNNEL_DOWN" };
       namedRepair = { needed: true, userMessage: NAMED_REPAIR_MESSAGE };
@@ -714,6 +810,7 @@ program
       sandbox: "Sandbox",
       workspace: "Workspace",
       bridge: "Bridge",
+      remoteTunnelConnectors: "Remote Tunnel connectors",
       mcp: "MCP",
       oauth: "OAuth",
       tunnel: "Tunnel",
@@ -957,8 +1054,7 @@ session
   .option("--known-issues <text>")
   .option("--next-step <text>")
   .option("--clear-checkpoint", "drop the active checkpoint (task DONE)", false)
-  .action(
-    (opts: {
+  .action((opts: {
       workspace?: string;
       url?: string;
       title?: string;
@@ -1124,8 +1220,7 @@ program
   .option("--output <text>", "command output (prefer --output-file for long logs)")
   .option("--output-file <path>", "read command output from a local file")
   .option("--exit-code <n>", "numeric exit code of that command", parseInteger)
-  .action(
-    (opts: {
+  .action(async (opts: {
       workspace?: string;
       task: string;
       iteration: number;
@@ -1139,26 +1234,14 @@ program
       outputFile?: string;
       exitCode?: number;
     }) => {
+      try {
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
       const changed = parseChangedFiles(opts.changedFiles);
-      let outputId: number | undefined;
-      let outputAvailable = false;
       const rawOutput =
         opts.outputFile !== undefined
           ? readCappedUtf8(path.resolve(opts.outputFile), MAX_RECORD_OUTPUT_READ)
           : opts.output;
-      if (opts.command && rawOutput !== undefined) {
-        const savedOutput = saveExecutionOutput(workspace.id, {
-          command: opts.command,
-          raw: rawOutput,
-          exitCode: opts.exitCode ?? null,
-          taskId: opts.task,
-          iteration: opts.iteration,
-        });
-        outputId = savedOutput.id;
-        outputAvailable = savedOutput.allowed;
-      }
-      appendExecutionRecord(workspace.id, {
+      const record = {
         taskId: opts.task,
         iteration: opts.iteration,
         changedFiles: changed,
@@ -1167,14 +1250,89 @@ program
         timestamp: new Date().toISOString(),
         executor: opts.executor?.slice(0, 80),
         notes: opts.notes?.slice(0, 400),
-        outputId,
-        outputAvailable,
-      });
-      if (outputId !== undefined && !outputAvailable) check("已记录执行摘要（输出未对 ChatGPT 开放）");
-      else if (outputId !== undefined) check("已记录执行摘要与输出");
+      };
+      const output = opts.command && rawOutput !== undefined
+        ? { command: opts.command, raw: rawOutput, exitCode: opts.exitCode ?? null }
+        : undefined;
+      const observation = await findBridgeObservation(workspace.id);
+      if (observation.state !== "healthy") {
+        throw new Error(`BRIDGE_EXECUTION_STORE_UNAVAILABLE: cannot verify the active Bridge for workspace ${workspace.id} (${observation.state === "unknown" ? observation.reason : observation.reason}).`);
+      }
+      const saved = await adminFetch<{
+        ok: boolean; workspaceId: string; taskId: string; iteration: number; exists: boolean;
+        outputId?: number; outputAvailable?: boolean; stateStoreFingerprint: string;
+      }>(observation.runtime, "POST", "/admin/execution/record", 60_000, undefined, { record, output });
+      if (!saved.ok || saved.workspaceId !== workspace.id || saved.taskId !== opts.task ||
+        saved.iteration !== opts.iteration || !saved.exists) {
+        throw new Error("BRIDGE_EXECUTION_RECORD_UNVERIFIED: Bridge did not confirm the exact recorded task and iteration.");
+      }
+      writeExecutionStoreBinding(workspace.id, saved.stateStoreFingerprint);
+      if (saved.outputId !== undefined && !saved.outputAvailable) check("已记录 Bridge execution 摘要（输出未对 ChatGPT 开放）");
+      else if (saved.outputId !== undefined) check("已记录 Bridge execution 摘要与输出");
       else check("已记录执行摘要");
+      } catch (error) {
+        handleCliError(error, false);
+      }
+  });
+
+program
+  .command("record-check", { hidden: true })
+  .description("Verify an execution record exists in the formal workspace store")
+  .requiredOption("-w, --workspace <path>")
+  .requiredOption("--task <id>")
+  .requiredOption("--iteration <n>", "non-negative execution iteration", parseNonNegativeInteger)
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace: string; task: string; iteration: number; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const configuredStateDirFingerprint = canonicalPathFingerprint(getStateDir());
+    const result: Record<string, unknown> = {
+      ok: false,
+      workspaceId: workspace.id,
+      taskId: opts.task,
+      iteration: opts.iteration,
+      configuredStateDirFingerprint,
+    };
+    try {
+      const observation = await findBridgeObservation(workspace.id);
+      if (observation.state !== "healthy") {
+        throw new Error(`BRIDGE_EXECUTION_CHECK_UNAVAILABLE: ${observation.state === "unknown" ? observation.reason : observation.reason}`);
+      }
+      const bridgeCheck = await adminFetch<{
+        workspaceId: string; taskId: string; iteration: number; exists: boolean; stateStoreFingerprint: string;
+      }>(observation.runtime, "GET",
+        `/admin/execution/check?task=${encodeURIComponent(opts.task)}&iteration=${opts.iteration}`);
+      if (bridgeCheck.workspaceId !== workspace.id || bridgeCheck.taskId !== opts.task || bridgeCheck.iteration !== opts.iteration) {
+        throw new Error("BRIDGE_EXECUTION_CHECK_IDENTITY_MISMATCH");
+      }
+      const binding = readExecutionStoreBinding(workspace.id);
+      const selectedStoreFingerprint = binding?.stateStoreFingerprint ?? configuredStateDirFingerprint;
+      result.bridgeExecutionStoreFingerprint = bridgeCheck.stateStoreFingerprint;
+      result.selectedExecutionStoreFingerprint = selectedStoreFingerprint;
+      result.configuredStateDirDiffers = configuredStateDirFingerprint !== bridgeCheck.stateStoreFingerprint;
+      result.bridgeRecordExists = bridgeCheck.exists;
+      result.storeBinding = binding ? "bridge" : "local";
+      if (selectedStoreFingerprint !== bridgeCheck.stateStoreFingerprint) {
+        throw new Error(`STORE_MISMATCH: selected execution store ${selectedStoreFingerprint} differs from the Bridge execution store ${bridgeCheck.stateStoreFingerprint}.`);
+      }
+      const localExists = hasExecutionRecord(workspace.id, opts.task, opts.iteration);
+      if (!bridgeCheck.exists) {
+        if (localExists) throw new Error("STORE_MISMATCH: local record exists but the Bridge execution store does not contain it.");
+        throw new Error("BRIDGE_EXECUTION_RECORD_MISSING: the active Bridge has no exact task and iteration record.");
+      }
+      if (!binding && !localExists) {
+        throw new Error("STORE_MISMATCH: the Bridge reports a record that is absent from the selected local store.");
+      }
+      result.ok = true;
+      if (opts.json) say(JSON.stringify(result));
+      else check(`已通过 Bridge 验证 execution record：${opts.task} / iteration ${opts.iteration}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      result.error = message;
+      if (opts.json) say(JSON.stringify(result));
+      else cross(message);
+      process.exitCode = 1;
     }
-  );
+  });
 
 const tunnelCmd = program.command("tunnel").description("Choose or inspect the public connection for this workspace");
 

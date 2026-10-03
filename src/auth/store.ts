@@ -1,7 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { canonicalPathFingerprint, ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 
 export const SUPPORTED_SCOPES = [
   "workspace.read",
@@ -48,6 +48,22 @@ interface PersistedAuthState {
   tokens: TokenRecord[];
 }
 
+export interface AuthStoreDiagnostics {
+  stateDirFingerprint: string;
+  storePathFingerprint: string;
+  inMemoryTokenCount: number;
+  inMemoryExpiredTokenCount: number;
+  persistedTokenCount: number;
+  persistedTokenRecordCount: number;
+  latestInMemoryIssuedAt: string | null;
+  latestPersistedIssuedAt: string | null;
+  refreshTokenCount: number;
+  offlineAccessRefreshCount: number;
+  persistedRefreshTokenCount: number;
+  persistedOfflineAccessRefreshCount: number;
+  storeFileMtime: string | null;
+}
+
 export type VerifyTokenResult =
   | { ok: true; record: TokenRecord }
   | { ok: false; reason: "unknown" | "expired" | "revoked" | "wrong_kind" };
@@ -55,6 +71,10 @@ export type VerifyTokenResult =
 const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
 const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const AUTH_CODE_TTL_MS = 5 * 60 * 1000;
+
+export function authStoreFilePath(workspaceId: string): string {
+  return path.join(getStateDir(), "auth", `${workspaceId}.json`);
+}
 
 function sha256hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -81,14 +101,54 @@ export class AuthStore {
   private tokens = new Map<string, TokenRecord>();
   private authCodes = new Map<string, AuthorizationCodeRecord>();
   private readonly file: string;
+  private readonly stateDir: string;
 
   constructor(
     readonly workspaceId: string,
     opts: { file?: string } = {}
   ) {
-    this.file =
-      opts.file ?? path.join(ensureDir(path.join(getStateDir(), "auth")), `${workspaceId}.json`);
+    this.stateDir = getStateDir();
+    this.file = opts.file ?? authStoreFilePath(workspaceId);
+    if (!opts.file) ensureDir(path.dirname(this.file));
     this.load();
+  }
+
+  diagnostics(): AuthStoreDiagnostics {
+    const now = Date.now();
+    const inMemory = [...this.tokens.values()];
+    const persistedState = readJsonIfExists<PersistedAuthState>(this.file);
+    const persistedRecords = Array.isArray(persistedState?.tokens) ? persistedState.tokens : [];
+    const loadableRecords = persistedRecords.filter((token) => !token.revoked && token.expiresAt > now);
+    const memoryRefreshTokens = inMemory.filter((token) => token.kind === "refresh");
+    const persistedRefreshTokens = loadableRecords.filter((token) => token.kind === "refresh");
+    const latestIssuedAt = (records: TokenRecord[]): string | null => {
+      const latest = records.reduce<number | null>((value, record) =>
+        value === null || record.issuedAt > value ? record.issuedAt : value, null);
+      return latest === null ? null : new Date(latest).toISOString();
+    };
+    let storeFileMtime: string | null = null;
+    try {
+      storeFileMtime = fs.statSync(this.file).mtime.toISOString();
+    } catch {
+      // An absent store has no modification time.
+    }
+
+    return {
+      stateDirFingerprint: canonicalPathFingerprint(this.stateDir),
+      storePathFingerprint: canonicalPathFingerprint(this.file),
+      inMemoryTokenCount: inMemory.length,
+      inMemoryExpiredTokenCount: inMemory.filter((token) => token.expiresAt <= now).length,
+      persistedTokenCount: loadableRecords.length,
+      persistedTokenRecordCount: persistedRecords.length,
+      latestInMemoryIssuedAt: latestIssuedAt(inMemory),
+      latestPersistedIssuedAt: latestIssuedAt(persistedRecords),
+      refreshTokenCount: memoryRefreshTokens.length,
+      offlineAccessRefreshCount: memoryRefreshTokens.filter((token) => token.scopes.includes("offline_access")).length,
+      persistedRefreshTokenCount: persistedRefreshTokens.length,
+      persistedOfflineAccessRefreshCount: persistedRefreshTokens
+        .filter((token) => token.scopes.includes("offline_access")).length,
+      storeFileMtime,
+    };
   }
 
   private load(): void {
